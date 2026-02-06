@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 app = FastAPI()
 
-SECRET = "DEIN_SECRET"  # <- ändere das!
+SECRET = "claus-2026-xau-01!"  #
 
 class TVSignal(BaseModel):
     key: str
