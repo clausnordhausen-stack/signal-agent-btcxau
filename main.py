@@ -1,102 +1,42 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from datetime import datetime, timezone
 
-app = FastAPI(title="Signal Agent API", version="1.0")
+app = FastAPI()
+
+SECRET = "DEIN_SECRET"  # <- ändere das!
+
+class TVSignal(BaseModel):
+    key: str
+    symbol: str
+    action: str   # BUY / SELL
+    ts: str | None = None
+    id: str | None = None
+
+LAST = {"signal": None, "updated_utc": None}
 
 @app.get("/")
 def root():
-    return {"message": "Signal Agent API is running"}
+    return {"status": "Signal Agent API is running"}
 
-@app.get("/v1/signal")
-def get_signal(symbol: str = Query(..., description="BTCUSD or XAUUSD")):
-    symbol = symbol.upper().strip()
-    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+@app.post("/tv")
+def tv_webhook(sig: TVSignal):
+    if sig.key != SECRET:
+        raise HTTPException(status_code=401, detail="bad key")
 
-    if symbol not in ("BTCUSD", "XAUUSD"):
-        return {
-            "schema": "signal_v1_2",
-            "trade_allowed": False,
-            "error": "unsupported_symbol",
-            "supported": ["BTCUSD", "XAUUSD"]
-        }
+    act = sig.action.upper().strip()
+    if act not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="bad action")
 
-    if symbol == "BTCUSD":
-        return {
-            "schema": "signal_v1_2",
-            "signal_id": "demo-btcusd-001",
-            "symbol": "BTCUSD",
-            "generated_at_utc": now,
-            "valid_until_utc": now,
-            "trade_allowed": True,
-            "selected_module": "ORB_BREAKOUT",
-            "oco_group": "DEMO_ORB_BTCUSD",
-            "orders": [
-                {
-                    "type": "BUYSTOP",
-                    "price": 0.0,
-                    "sl_price": 0.0,
-                    "tp1_price": 0.0,
-                    "tp2_price": 0.0,
-                    "expiration_utc": now
-                },
-                {
-                    "type": "SELLSTOP",
-                    "price": 0.0,
-                    "sl_price": 0.0,
-                    "tp1_price": 0.0,
-                    "tp2_price": 0.0,
-                    "expiration_utc": now
-                }
-            ],
-            "constraints": {
-                "max_spread_points": 0,
-                "max_slippage_points": 0,
-                "place_policy": "PLACE_ON_NEWBAR"
-            },
-            "risk": {
-                "max_risk_usd": 10.0,
-                "max_trades_today": 2
-            },
-            "trail": {
-                "enabled": True,
-                "mode": "atr",
-                "atr_mult": 2.0
-            },
-            "reason": "Demo ORB BTCUSD (Platzhalter, Preise = 0)"
-        }
-
-    # XAUUSD
-    return {
-        "schema": "signal_v1_2",
-        "signal_id": "demo-xauusd-001",
-        "symbol": "XAUUSD",
-        "generated_at_utc": now,
-        "valid_until_utc": now,
-        "trade_allowed": True,
-        "selected_module": "TREND_PULLBACK",
-        "orders": [
-            {
-                "type": "BUYLIMIT",
-                "price": 0.0,
-                "sl_price": 0.0,
-                "tp1_price": 0.0,
-                "tp2_price": 0.0,
-                "expiration_utc": now
-            }
-        ],
-        "constraints": {
-            "max_spread_points": 0,
-            "max_slippage_points": 0,
-            "place_policy": "PLACE_ON_NEWBAR"
-        },
-        "risk": {
-            "max_risk_usd": 10.0,
-            "max_trades_today": 2
-        },
-        "trail": {
-            "enabled": True,
-            "mode": "atr",
-            "atr_mult": 2.0
-        },
-        "reason": "Demo Trend Pullback XAUUSD (Platzhalter, Preise = 0)"
+    LAST["signal"] = {
+        "symbol": sig.symbol.strip(),
+        "action": act,
+        "ts": sig.ts,
+        "id": sig.id
     }
+    LAST["updated_utc"] = datetime.now(timezone.utc).isoformat()
+    return {"ok": True}
+
+@app.get("/latest")
+def latest():
+    return {"signal": LAST["signal"], "updated_utc": LAST["updated_utc"]}
