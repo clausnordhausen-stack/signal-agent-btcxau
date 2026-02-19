@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
 from collections import deque
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 import os
 import sqlite3
 from threading import Lock
@@ -12,13 +12,15 @@ app = FastAPI(title="Signal Agent API")
 # =========================
 # CONFIG
 # =========================
-# Better: set SECRET_KEY in Render env vars. Fallback works for local tests.
 SECRET = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "50"))
 
-# SQLite: for real persistence on Render, mount a Disk and set DB_PATH e.g. /var/data/data.db
+# Persist DB on Render by mounting a Disk and setting: DB_PATH=/var/data/data.db
 DB_PATH = os.getenv("DB_PATH", "data.db")
 _db_lock = Lock()
+
+# Your production magics (still useful for filtering / dashboards)
+MAGICS_PROD = {61001, 61002}
 
 # =========================
 # MODELS
@@ -55,18 +57,17 @@ class DealEvent(BaseModel):
     comment: Optional[str] = None
 
 # =========================
-# STATE (signals)
+# SIGNAL STATE
 # =========================
-# symbol -> {"latest": {...}, "updated_utc": "...", "queue": deque([...]), "ack": "..."}
 STATE: Dict[str, Dict[str, Any]] = {}
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def norm_symbol(s: str) -> str:
+def norm_symbol(s: Optional[str]) -> str:
     return (s or "").strip().upper()
 
-def norm_action(a: str) -> str:
+def norm_action(a: Optional[str]) -> str:
     return (a or "").strip().upper()
 
 def ensure_sym(sym: str) -> None:
@@ -123,7 +124,91 @@ def _startup():
     db_init()
 
 # =========================
-# ROOT / HEALTH
+# HELPERS: FILTER + KPI
+# =========================
+def _build_where(symbol: Optional[str], magic: Optional[int],
+                 date_from: Optional[str], date_to: Optional[str]) -> Tuple[str, List[Any]]:
+    clauses: List[str] = []
+    args: List[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        args.append(norm_symbol(symbol))
+    if magic is not None:
+        clauses.append("magic = ?")
+        args.append(magic)
+    if date_from:
+        clauses.append("close_time >= ?")
+        args.append(date_from)
+    if date_to:
+        clauses.append("close_time <= ?")
+        args.append(date_to)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, args
+
+def _pnl_row(r: sqlite3.Row) -> float:
+    return float((r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0))
+
+def _compute_max_dd_from_equity(equity: List[float]) -> float:
+    peak = float("-inf")
+    max_dd = 0.0
+    for eq in equity:
+        if eq > peak:
+            peak = eq
+        dd = peak - eq
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd
+
+def _compute_kpis_from_pnls(pnls: List[float]) -> Dict[str, Any]:
+    trades = len(pnls)
+    wins = sum(1 for x in pnls if x > 0)
+    losses = sum(1 for x in pnls if x < 0)
+    breakeven = trades - wins - losses
+
+    gross_profit = sum(x for x in pnls if x > 0)
+    gross_loss_abs = abs(sum(x for x in pnls if x < 0))
+    net_profit = sum(pnls)
+    avg_trade = (net_profit / trades) if trades else 0.0
+    winrate = (wins / trades * 100.0) if trades else 0.0
+    profit_factor = (gross_profit / gross_loss_abs) if gross_loss_abs > 0 else None
+
+    equity = []
+    eq = 0.0
+    for p in pnls:
+        eq += (p or 0.0)
+        equity.append(eq)
+    max_dd = _compute_max_dd_from_equity(equity) if trades else 0.0
+
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "winrate_pct": round(winrate, 2),
+        "net_profit": round(net_profit, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss_abs": round(gross_loss_abs, 2),
+        "profit_factor": (round(profit_factor, 3) if profit_factor is not None else None),
+        "avg_trade": round(avg_trade, 2),
+        "max_drawdown": round(max_dd, 2),
+    }
+
+def _magic_filter_list(magics_csv: Optional[str]) -> Optional[List[int]]:
+    """
+    Parse "61001,61002" -> [61001,61002]
+    If missing -> None
+    """
+    if not magics_csv:
+        return None
+    parts = [p.strip() for p in magics_csv.split(",") if p.strip() != ""]
+    out: List[int] = []
+    for p in parts:
+        if p.isdigit():
+            out.append(int(p))
+    return out if out else None
+
+# =========================
+# ROOT
 # =========================
 @app.get("/")
 def root():
@@ -175,8 +260,6 @@ def queue(symbol: str):
         return {"symbol": sym, "items": []}
     return {"symbol": sym, "items": list(STATE[sym]["queue"])}
 
-# ACK: EA ruft auf: POST /ack?symbol=BTCUSD&updated_utc=...
-# Wenn ack == aktuellstes updated_utc -> latest wird gelöscht
 @app.post("/ack")
 def ack(symbol: str, updated_utc: str):
     sym = norm_symbol(symbol)
@@ -204,7 +287,7 @@ def ack_status(symbol: str):
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
 
 # =========================
-# DEAL INGEST (MT5 -> API)
+# DEAL INGEST (MT5 -> API)  (MANUAL TRADES ALLOWED)
 # =========================
 @app.post("/deal")
 def ingest_deal(d: DealEvent):
@@ -238,15 +321,21 @@ def ingest_deal(d: DealEvent):
 
     return {"ok": True, "id": row_id, "received_utc": received, "symbol": sym}
 
+# =========================
+# DEALS LIST
+# =========================
 @app.get("/deals")
 def list_deals(
     symbol: Optional[str] = None,
     magic: Optional[int] = None,
+    magics: Optional[str] = None,          # "61001,61002" (optional)
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 200
 ):
     limit = max(1, min(limit, 2000))
+
+    magics_list = _magic_filter_list(magics)
     clauses: List[str] = []
     args: List[Any] = []
 
@@ -256,6 +345,10 @@ def list_deals(
     if magic is not None:
         clauses.append("magic = ?")
         args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
     if date_from:
         clauses.append("close_time >= ?")
         args.append(date_from)
@@ -270,44 +363,40 @@ def list_deals(
         ORDER BY COALESCE(close_time, received_utc) DESC
         LIMIT ?
     """
-    args.append(limit)
+    args2 = args + [limit]
 
     with _db_lock:
         conn = db_conn()
-        rows = conn.execute(sql, args).fetchall()
+        rows = conn.execute(sql, args2).fetchall()
         conn.close()
 
     return {"items": [dict(r) for r in rows], "count": len(rows)}
 
-def _compute_max_dd(pnls: List[float]) -> float:
-    peak = 0.0
-    max_dd = 0.0
-    eq = 0.0
-    for p in pnls:
-        eq += (p or 0.0)
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-    return max_dd
-
+# =========================
+# KPI: OVERALL
+# =========================
 @app.get("/kpis")
 def kpis(
     symbol: Optional[str] = None,
     magic: Optional[int] = None,
+    magics: Optional[str] = None,          # "61001,61002"
     date_from: Optional[str] = None,
     date_to: Optional[str] = None
 ):
+    magics_list = _magic_filter_list(magics)
+
     clauses: List[str] = []
     args: List[Any] = []
-
     if symbol:
         clauses.append("symbol = ?")
         args.append(norm_symbol(symbol))
     if magic is not None:
         clauses.append("magic = ?")
         args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
     if date_from:
         clauses.append("close_time >= ?")
         args.append(date_from)
@@ -328,40 +417,231 @@ def kpis(
         rows = conn.execute(sql, args).fetchall()
         conn.close()
 
-    pnls: List[float] = []
+    pnls = [_pnl_row(r) for r in rows]
+    out = _compute_kpis_from_pnls(pnls)
+    out["filters"] = {
+        "symbol": norm_symbol(symbol) if symbol else None,
+        "magic": magic,
+        "magics": magics_list,
+        "from": date_from,
+        "to": date_to
+    }
+    return out
+
+# =========================
+# KPI: BY MAGIC
+# =========================
+@app.get("/kpis/by_magic")
+def kpis_by_magic(
+    symbol: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None
+):
+    where, args = _build_where(symbol, None, date_from, date_to)
+
+    sql = f"""
+        SELECT magic, profit, commission, swap, close_time, received_utc
+        FROM deals
+        {where}
+        ORDER BY COALESCE(close_time, received_utc) ASC
+    """
+
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(sql, args).fetchall()
+        conn.close()
+
+    buckets: Dict[str, List[float]] = {}
     for r in rows:
-        p = (r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0)
-        pnls.append(float(p))
-
-    trades = len(pnls)
-    wins = sum(1 for x in pnls if x > 0)
-    losses = sum(1 for x in pnls if x < 0)
-    breakeven = trades - wins - losses
-
-    gross_profit = sum(x for x in pnls if x > 0)
-    gross_loss_abs = abs(sum(x for x in pnls if x < 0))
-    net_profit = sum(pnls)
-    avg_trade = (net_profit / trades) if trades else 0.0
-    winrate = (wins / trades * 100.0) if trades else 0.0
-    profit_factor = (gross_profit / gross_loss_abs) if gross_loss_abs > 0 else None
-    max_dd = _compute_max_dd(pnls) if trades else 0.0
+        m = r["magic"]
+        key = str(m) if m is not None else "None"
+        buckets.setdefault(key, []).append(_pnl_row(r))
 
     return {
-        "filters": {
-            "symbol": norm_symbol(symbol) if symbol else None,
-            "magic": magic,
-            "from": date_from,
-            "to": date_to
-        },
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "winrate_pct": round(winrate, 2),
-        "net_profit": round(net_profit, 2),
-        "gross_profit": round(gross_profit, 2),
-        "gross_loss_abs": round(gross_loss_abs, 2),
-        "profit_factor": (round(profit_factor, 3) if profit_factor is not None else None),
-        "avg_trade": round(avg_trade, 2),
-        "max_drawdown": round(max_dd, 2)
+        "filters": {"symbol": norm_symbol(symbol) if symbol else None, "from": date_from, "to": date_to},
+        "items": {k: _compute_kpis_from_pnls(v) for k, v in buckets.items()},
+        "count_magics": len(buckets),
+        "prod_magics": sorted(MAGICS_PROD),
+    }
+
+# =========================
+# KPI: DAILY
+# =========================
+@app.get("/kpis/daily")
+def kpis_daily(
+    symbol: Optional[str] = None,
+    magic: Optional[int] = None,
+    magics: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None
+):
+    magics_list = _magic_filter_list(magics)
+
+    clauses: List[str] = []
+    args: List[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        args.append(norm_symbol(symbol))
+    if magic is not None:
+        clauses.append("magic = ?")
+        args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
+    if date_from:
+        clauses.append("close_time >= ?")
+        args.append(date_from)
+    if date_to:
+        clauses.append("close_time <= ?")
+        args.append(date_to)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT
+          SUBSTR(close_time,1,10) AS day,
+          profit, commission, swap, close_time, received_utc
+        FROM deals
+        {where}
+        ORDER BY COALESCE(close_time, received_utc) ASC
+    """
+
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(sql, args).fetchall()
+        conn.close()
+
+    daily: Dict[str, List[float]] = {}
+    for r in rows:
+        day = r["day"] or "unknown"
+        daily.setdefault(day, []).append(_pnl_row(r))
+
+    items = []
+    for day in sorted(daily.keys()):
+        k = _compute_kpis_from_pnls(daily[day])
+        k["day"] = day
+        items.append(k)
+
+    return {
+        "filters": {"symbol": norm_symbol(symbol) if symbol else None, "magic": magic, "magics": magics_list, "from": date_from, "to": date_to},
+        "items": items,
+        "days": len(items),
+        "prod_magics": sorted(MAGICS_PROD),
+    }
+
+# =========================
+# EQUITY CURVE
+# =========================
+@app.get("/equity")
+def equity_curve(
+    symbol: Optional[str] = None,
+    magic: Optional[int] = None,
+    magics: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 5000
+):
+    limit = max(1, min(limit, 5000))
+    magics_list = _magic_filter_list(magics)
+
+    clauses: List[str] = []
+    args: List[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        args.append(norm_symbol(symbol))
+    if magic is not None:
+        clauses.append("magic = ?")
+        args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
+    if date_from:
+        clauses.append("close_time >= ?")
+        args.append(date_from)
+    if date_to:
+        clauses.append("close_time <= ?")
+        args.append(date_to)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT profit, commission, swap, close_time, received_utc
+        FROM deals
+        {where}
+        ORDER BY COALESCE(close_time, received_utc) ASC
+        LIMIT ?
+    """
+    args2 = args + [limit]
+
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(sql, args2).fetchall()
+        conn.close()
+
+    eq = 0.0
+    points = []
+    for r in rows:
+        pnl = _pnl_row(r)
+        eq += pnl
+        t = r["close_time"] or r["received_utc"]
+        points.append({"t": t, "pnl": round(pnl, 2), "equity": round(eq, 2)})
+
+    return {
+        "filters": {"symbol": norm_symbol(symbol) if symbol else None, "magic": magic, "magics": magics_list, "from": date_from, "to": date_to},
+        "points": points,
+        "count": len(points),
+        "equity_end": round(eq, 2)
+    }
+
+# =========================
+# SUMMARY
+# =========================
+@app.get("/summary")
+def summary(symbol: Optional[str] = None, magic: Optional[int] = None, magics: Optional[str] = None):
+    magics_list = _magic_filter_list(magics)
+
+    clauses: List[str] = []
+    args: List[Any] = []
+    if symbol:
+        clauses.append("symbol = ?")
+        args.append(norm_symbol(symbol))
+    if magic is not None:
+        clauses.append("magic = ?")
+        args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = f"""
+        SELECT * FROM deals
+        {where}
+        ORDER BY COALESCE(close_time, received_utc) DESC
+        LIMIT 20
+    """
+
+    with _db_lock:
+        conn = db_conn()
+        last = conn.execute(sql, args).fetchall()
+        conn.close()
+
+    overall = kpis(symbol=symbol, magic=magic, magics=magics, date_from=None, date_to=None)
+
+    sigs = {}
+    if symbol:
+        s = norm_symbol(symbol)
+        if s in STATE:
+            sigs[s] = {"latest": STATE[s].get("latest"), "updated_utc": STATE[s].get("updated_utc"), "ack": STATE[s].get("ack")}
+    else:
+        for s in list(STATE.keys())[:50]:
+            sigs[s] = {"latest": STATE[s].get("latest"), "updated_utc": STATE[s].get("updated_utc"), "ack": STATE[s].get("ack")}
+
+    return {
+        "filters": {"symbol": norm_symbol(symbol) if symbol else None, "magic": magic, "magics": magics_list},
+        "kpis": overall,
+        "last_deals": [dict(r) for r in last],
+        "signals": sigs,
+        "prod_magics": sorted(MAGICS_PROD),
+        "note": "Manual trades allowed: /deal does not enforce magic."
     }
