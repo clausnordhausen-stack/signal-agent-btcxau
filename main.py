@@ -126,25 +126,6 @@ def _startup():
 # =========================
 # HELPERS: FILTER + KPI
 # =========================
-def _build_where(symbol: Optional[str], magic: Optional[int],
-                 date_from: Optional[str], date_to: Optional[str]) -> Tuple[str, List[Any]]:
-    clauses: List[str] = []
-    args: List[Any] = []
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if date_from:
-        clauses.append("close_time >= ?")
-        args.append(date_from)
-    if date_to:
-        clauses.append("close_time <= ?")
-        args.append(date_to)
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    return where, args
-
 def _pnl_row(r: sqlite3.Row) -> float:
     return float((r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0))
 
@@ -193,11 +174,32 @@ def _compute_kpis_from_pnls(pnls: List[float]) -> Dict[str, Any]:
         "max_drawdown": round(max_dd, 2),
     }
 
+def _rolling_tail(values: List[float], n: int) -> List[float]:
+    if n <= 0:
+        return values
+    if len(values) <= n:
+        return values
+    return values[-n:]
+
+def _loss_streak(pnls: List[float]) -> int:
+    s = 0
+    for x in reversed(pnls):
+        if x < 0:
+            s += 1
+        else:
+            break
+    return s
+
+def _win_streak(pnls: List[float]) -> int:
+    s = 0
+    for x in reversed(pnls):
+        if x > 0:
+            s += 1
+        else:
+            break
+    return s
+
 def _magic_filter_list(magics_csv: Optional[str]) -> Optional[List[int]]:
-    """
-    Parse "61001,61002" -> [61001,61002]
-    If missing -> None
-    """
     if not magics_csv:
         return None
     parts = [p.strip() for p in magics_csv.split(",") if p.strip() != ""]
@@ -207,12 +209,46 @@ def _magic_filter_list(magics_csv: Optional[str]) -> Optional[List[int]]:
             out.append(int(p))
     return out if out else None
 
+def _today_mt5_day_str() -> str:
+    # We match MT5 close_time day format "YYYY.MM.DD"
+    return datetime.now().strftime("%Y.%m.%d")
+
+def _build_filters_where(symbol: Optional[str], magic: Optional[int], magics_list: Optional[List[int]],
+                         date_from: Optional[str], date_to: Optional[str]) -> Tuple[str, List[Any]]:
+    clauses: List[str] = []
+    args: List[Any] = []
+
+    if symbol:
+        clauses.append("symbol = ?")
+        args.append(norm_symbol(symbol))
+    if magic is not None:
+        clauses.append("magic = ?")
+        args.append(magic)
+    if magics_list:
+        placeholders = ",".join(["?"] * len(magics_list))
+        clauses.append(f"magic IN ({placeholders})")
+        args.extend(magics_list)
+    if date_from:
+        clauses.append("close_time >= ?")
+        args.append(date_from)
+    if date_to:
+        clauses.append("close_time <= ?")
+        args.append(date_to)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, args
+
 # =========================
 # ROOT
 # =========================
 @app.get("/")
 def root():
     return {"status": "Signal Agent API is running"}
+
+# Optional: avoid Render HEAD / 405 noise
+@app.head("/")
+def head_root():
+    return
 
 # =========================
 # SIGNAL INGEST (TradingView)
@@ -328,35 +364,15 @@ def ingest_deal(d: DealEvent):
 def list_deals(
     symbol: Optional[str] = None,
     magic: Optional[int] = None,
-    magics: Optional[str] = None,          # "61001,61002" (optional)
+    magics: Optional[str] = None,          # "61001,61002"
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 200
 ):
     limit = max(1, min(limit, 2000))
-
     magics_list = _magic_filter_list(magics)
-    clauses: List[str] = []
-    args: List[Any] = []
+    where, args = _build_filters_where(symbol, magic, magics_list, date_from, date_to)
 
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if magics_list:
-        placeholders = ",".join(["?"] * len(magics_list))
-        clauses.append(f"magic IN ({placeholders})")
-        args.extend(magics_list)
-    if date_from:
-        clauses.append("close_time >= ?")
-        args.append(date_from)
-    if date_to:
-        clauses.append("close_time <= ?")
-        args.append(date_to)
-
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT * FROM deals
         {where}
@@ -384,27 +400,8 @@ def kpis(
     date_to: Optional[str] = None
 ):
     magics_list = _magic_filter_list(magics)
+    where, args = _build_filters_where(symbol, magic, magics_list, date_from, date_to)
 
-    clauses: List[str] = []
-    args: List[Any] = []
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if magics_list:
-        placeholders = ",".join(["?"] * len(magics_list))
-        clauses.append(f"magic IN ({placeholders})")
-        args.extend(magics_list)
-    if date_from:
-        clauses.append("close_time >= ?")
-        args.append(date_from)
-    if date_to:
-        clauses.append("close_time <= ?")
-        args.append(date_to)
-
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT profit, commission, swap, close_time, received_utc
         FROM deals
@@ -429,42 +426,6 @@ def kpis(
     return out
 
 # =========================
-# KPI: BY MAGIC
-# =========================
-@app.get("/kpis/by_magic")
-def kpis_by_magic(
-    symbol: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None
-):
-    where, args = _build_where(symbol, None, date_from, date_to)
-
-    sql = f"""
-        SELECT magic, profit, commission, swap, close_time, received_utc
-        FROM deals
-        {where}
-        ORDER BY COALESCE(close_time, received_utc) ASC
-    """
-
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(sql, args).fetchall()
-        conn.close()
-
-    buckets: Dict[str, List[float]] = {}
-    for r in rows:
-        m = r["magic"]
-        key = str(m) if m is not None else "None"
-        buckets.setdefault(key, []).append(_pnl_row(r))
-
-    return {
-        "filters": {"symbol": norm_symbol(symbol) if symbol else None, "from": date_from, "to": date_to},
-        "items": {k: _compute_kpis_from_pnls(v) for k, v in buckets.items()},
-        "count_magics": len(buckets),
-        "prod_magics": sorted(MAGICS_PROD),
-    }
-
-# =========================
 # KPI: DAILY
 # =========================
 @app.get("/kpis/daily")
@@ -476,27 +437,8 @@ def kpis_daily(
     date_to: Optional[str] = None
 ):
     magics_list = _magic_filter_list(magics)
+    where, args = _build_filters_where(symbol, magic, magics_list, date_from, date_to)
 
-    clauses: List[str] = []
-    args: List[Any] = []
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if magics_list:
-        placeholders = ",".join(["?"] * len(magics_list))
-        clauses.append(f"magic IN ({placeholders})")
-        args.extend(magics_list)
-    if date_from:
-        clauses.append("close_time >= ?")
-        args.append(date_from)
-    if date_to:
-        clauses.append("close_time <= ?")
-        args.append(date_to)
-
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT
           SUBSTR(close_time,1,10) AS day,
@@ -543,27 +485,8 @@ def equity_curve(
 ):
     limit = max(1, min(limit, 5000))
     magics_list = _magic_filter_list(magics)
+    where, args = _build_filters_where(symbol, magic, magics_list, date_from, date_to)
 
-    clauses: List[str] = []
-    args: List[Any] = []
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if magics_list:
-        placeholders = ",".join(["?"] * len(magics_list))
-        clauses.append(f"magic IN ({placeholders})")
-        args.extend(magics_list)
-    if date_from:
-        clauses.append("close_time >= ?")
-        args.append(date_from)
-    if date_to:
-        clauses.append("close_time <= ?")
-        args.append(date_to)
-
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT profit, commission, swap, close_time, received_utc
         FROM deals
@@ -594,26 +517,146 @@ def equity_curve(
     }
 
 # =========================
+# KPI: ROLLING (last N trades)
+# =========================
+@app.get("/kpis/rolling")
+def kpis_rolling(
+    symbol: Optional[str] = None,
+    magic: Optional[int] = None,
+    magics: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    n: int = 50
+):
+    n = max(1, min(n, 5000))
+    magics_list = _magic_filter_list(magics)
+    where, args = _build_filters_where(symbol, magic, magics_list, date_from, date_to)
+
+    sql = f"""
+        SELECT profit, commission, swap, close_time, received_utc
+        FROM deals
+        {where}
+        ORDER BY COALESCE(close_time, received_utc) ASC
+    """
+
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(sql, args).fetchall()
+        conn.close()
+
+    pnls_all = [_pnl_row(r) for r in rows]
+    pnls = _rolling_tail(pnls_all, n)
+
+    out = _compute_kpis_from_pnls(pnls)
+    out["filters"] = {
+        "symbol": norm_symbol(symbol) if symbol else None,
+        "magic": magic,
+        "magics": magics_list,
+        "from": date_from,
+        "to": date_to,
+        "n": n
+    }
+    out["loss_streak"] = _loss_streak(pnls)
+    out["win_streak"] = _win_streak(pnls)
+    out["net_last_n"] = round(sum(pnls), 2)
+    return out
+
+# =========================
+# STATUS: PROP-FIRM (your defaults)
+# =========================
+@app.get("/status/propfirm")
+def status_propfirma(
+    symbol: Optional[str] = None,
+
+    # Rolling window defaults (your spec)
+    n: int = 20,
+
+    # Rolling thresholds (your spec)
+    pf_min: float = 1.30,
+    net_last_n_min: float = -200.0,
+    loss_streak_max: int = 3,
+
+    # Trading Pit limits (your spec)
+    daily_dd_limit: float = 350.0,   # means day pnl must be > -350
+    total_dd_limit: float = 600.0    # means max_dd must be <= 600
+):
+    # 1) Rolling KPIs (last N trades, ALL trades – manual + any magic)
+    roll = kpis_rolling(symbol=symbol, magic=None, magics=None, n=n)
+
+    pf = roll.get("profit_factor", None)
+    net_last_n = float(roll.get("net_last_n", 0.0) or 0.0)
+    loss_streak = int(roll.get("loss_streak", 0) or 0)
+
+    # 2) Daily PnL (today) from daily KPIs
+    today = _today_mt5_day_str()
+    daily = kpis_daily(symbol=symbol, magic=None, magics=None, date_from=None, date_to=None)
+
+    today_item = None
+    for it in daily.get("items", []):
+        if it.get("day") == today:
+            today_item = it
+            break
+    today_net = float((today_item or {}).get("net_profit", 0.0) or 0.0)
+
+    # 3) Total DD from ALL equity points (increase limit to capture history)
+    eq = equity_curve(symbol=symbol, magic=None, magics=None, date_from=None, date_to=None, limit=5000)
+    points = eq.get("points", [])
+    equities = [float(p.get("equity", 0.0) or 0.0) for p in points] if points else []
+
+    peak = float("-inf")
+    max_dd = 0.0
+    for e in equities:
+        if e > peak:
+            peak = e
+        dd = peak - e
+        if dd > max_dd:
+            max_dd = dd
+
+    reasons: List[str] = []
+
+    # Rolling checks
+    if pf is not None and float(pf) < pf_min:
+        reasons.append(f"PF<{pf_min}")
+    if net_last_n < net_last_n_min:
+        reasons.append(f"NetLast{n}<{net_last_n_min}")
+    if loss_streak > loss_streak_max:
+        reasons.append(f"LossStreak>{loss_streak_max}")
+
+    # Daily DD: today net must be > -daily_dd_limit
+    if today_net <= -abs(daily_dd_limit):
+        reasons.append(f"DailyPnL<={-abs(daily_dd_limit)}")
+
+    # Total DD: max_dd must be <= total_dd_limit
+    if max_dd > abs(total_dd_limit):
+        reasons.append(f"TotalMaxDD>{abs(total_dd_limit)}")
+
+    level = "RED" if reasons else "GREEN"
+
+    return {
+        "level": level,
+        "reasons": reasons,
+        "symbol": norm_symbol(symbol) if symbol else None,
+        "rolling": roll,
+        "today": {"day": today, "net_profit": round(today_net, 2)},
+        "total": {"max_drawdown": round(max_dd, 2)},
+        "thresholds": {
+            "n": n,
+            "pf_min": pf_min,
+            "net_last_n_min": net_last_n_min,
+            "loss_streak_max": loss_streak_max,
+            "daily_dd_limit": -abs(daily_dd_limit),
+            "total_dd_limit": abs(total_dd_limit),
+        }
+    }
+
+# =========================
 # SUMMARY
 # =========================
 @app.get("/summary")
 def summary(symbol: Optional[str] = None, magic: Optional[int] = None, magics: Optional[str] = None):
     magics_list = _magic_filter_list(magics)
+    where, args = _build_filters_where(symbol, magic, magics_list, None, None)
 
-    clauses: List[str] = []
-    args: List[Any] = []
-    if symbol:
-        clauses.append("symbol = ?")
-        args.append(norm_symbol(symbol))
-    if magic is not None:
-        clauses.append("magic = ?")
-        args.append(magic)
-    if magics_list:
-        placeholders = ",".join(["?"] * len(magics_list))
-        clauses.append(f"magic IN ({placeholders})")
-        args.extend(magics_list)
-
-    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"""
         SELECT * FROM deals
         {where}
