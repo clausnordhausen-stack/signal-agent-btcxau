@@ -2,29 +2,25 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, timezone
 from collections import deque
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import os
 
-# =========================
-# APP
-# =========================
 app = FastAPI(title="Signal Agent API")
 
-# =========================
-# CONFIG
-# =========================
 FALLBACK_SECRET = "claus-2026-xau-01!"
 SECRET = os.getenv("SECRET_KEY") or FALLBACK_SECRET
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "50"))
 
-print("=== SIGNAL AGENT START ===")
-print("SECRET_KEY source:", "ENV" if os.getenv("SECRET_KEY") else "FALLBACK")
-print("QUEUE_MAX:", QUEUE_MAX)
-print("==========================")
+# Optional: Comma-separated list in Render env, e.g.:
+# CONSUMERS_XAUUSD="EA61001,EA61002"
+# CONSUMERS_BTCUSD="EA62001,EA62002"
+def expected_consumers_for(sym: str) -> List[str]:
+    key = f"CONSUMERS_{sym}"
+    raw = (os.getenv(key, "") or "").strip()
+    if not raw:
+        return []  # empty => "no strict list" (see behavior below)
+    return [p.strip() for p in raw.split(",") if p.strip()]
 
-# =========================
-# MODELS
-# =========================
 class TVSignal(BaseModel):
     key: str
     symbol: str
@@ -32,9 +28,6 @@ class TVSignal(BaseModel):
     ts: Optional[str] = None
     id: Optional[str] = None
 
-# =========================
-# STATE (in-memory)
-# =========================
 STATE: Dict[str, Dict[str, Any]] = {}
 
 def now_utc() -> str:
@@ -46,32 +39,20 @@ def norm_symbol(s: Optional[str]) -> str:
 def norm_action(a: Optional[str]) -> str:
     return (a or "").strip().upper()
 
-def ensure_symbol(sym: str) -> None:
+def norm_consumer(c: Optional[str]) -> str:
+    return (c or "").strip()
+
+def ensure_sym(sym: str) -> None:
     if sym not in STATE:
         STATE[sym] = {
             "latest": None,
             "updated_utc": None,
             "queue": deque(maxlen=QUEUE_MAX),
-            "ack": None,
+            # NEW: per-consumer ack map for CURRENT latest
+            # consumer -> updated_utc they acked
+            "acks": {},  # Dict[str,str]
         }
 
-# =========================
-# ROOT
-# =========================
-@app.get("/")
-def root():
-    return {
-        "status": "Signal Agent API is running",
-        "secret_source": "ENV" if os.getenv("SECRET_KEY") else "FALLBACK",
-    }
-
-@app.head("/")
-def head_root():
-    return
-
-# =========================
-# TRADINGVIEW WEBHOOK
-# =========================
 @app.post("/tv")
 def tv_webhook(sig: TVSignal):
     if sig.key != SECRET:
@@ -79,90 +60,101 @@ def tv_webhook(sig: TVSignal):
 
     sym = norm_symbol(sig.symbol)
     act = norm_action(sig.action)
-
     if not sym:
         raise HTTPException(status_code=400, detail="bad symbol")
     if act not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="bad action")
 
-    ensure_symbol(sym)
-
-    payload = {
-        "symbol": sym,
-        "action": act,
-        "ts": sig.ts,
-        "id": sig.id,
-    }
-
+    ensure_sym(sym)
+    payload = {"symbol": sym, "action": act, "ts": sig.ts, "id": sig.id}
     t = now_utc()
+
     STATE[sym]["latest"] = payload
     STATE[sym]["updated_utc"] = t
     STATE[sym]["queue"].append({"signal": payload, "updated_utc": t})
 
+    # NEW: reset per-consumer acks for the new latest
+    STATE[sym]["acks"] = {}
+
     return {"ok": True, "symbol": sym, "updated_utc": t}
 
-# =========================
-# LATEST SIGNAL
-# =========================
 @app.get("/latest")
-def latest(symbol: str):
+def latest(symbol: str, consumer: Optional[str] = None):
     sym = norm_symbol(symbol)
+    c = norm_consumer(consumer)
+
     if sym not in STATE or STATE[sym]["latest"] is None:
         return {"symbol": sym, "signal": None, "updated_utc": None}
 
-    return {
-        "symbol": sym,
-        "signal": STATE[sym]["latest"],
-        "updated_utc": STATE[sym]["updated_utc"],
-    }
+    u = STATE[sym]["updated_utc"]
+    if not u:
+        return {"symbol": sym, "signal": None, "updated_utc": None}
 
-# =========================
-# SIGNAL QUEUE
-# =========================
-@app.get("/queue")
-def queue(symbol: str):
-    sym = norm_symbol(symbol)
-    if sym not in STATE:
-        return {"symbol": sym, "items": []}
-    return {"symbol": sym, "items": list(STATE[sym]["queue"])}
+    # NEW: if consumer provided and has already acked this updated_utc -> hide it
+    if c:
+        acks: Dict[str, str] = STATE[sym].get("acks", {})
+        if acks.get(c) == u:
+            return {"symbol": sym, "signal": None, "updated_utc": None}
 
-# =========================
-# ACK (Signal verbraucht)
-# =========================
+    return {"symbol": sym, "signal": STATE[sym]["latest"], "updated_utc": u}
+
 @app.post("/ack")
-def ack(symbol: str, updated_utc: str):
+def ack(symbol: str, updated_utc: str, consumer: str):
     sym = norm_symbol(symbol)
+    u = (updated_utc or "").strip()
+    c = norm_consumer(consumer)
+
     if not sym:
         raise HTTPException(status_code=400, detail="bad symbol")
-    if not updated_utc:
+    if not u:
         raise HTTPException(status_code=400, detail="bad updated_utc")
+    if not c:
+        raise HTTPException(status_code=400, detail="bad consumer")
     if sym not in STATE:
         raise HTTPException(status_code=404, detail="unknown symbol")
 
-    STATE[sym]["ack"] = updated_utc
+    # record per-consumer ack
+    acks: Dict[str, str] = STATE[sym].setdefault("acks", {})
+    acks[c] = u
 
-    if STATE[sym]["updated_utc"] == updated_utc:
-        STATE[sym]["latest"] = None
-        STATE[sym]["updated_utc"] = None
+    cleared = False
+    # Clear latest ONLY if this ack matches the current latest updated_utc AND all expected consumers acked
+    cur_u = STATE[sym].get("updated_utc")
+
+    if cur_u == u:
+        exp = expected_consumers_for(sym)
+
+        if exp:
+            # strict mode: require all expected consumers to ack current updated_utc
+            all_ok = all(acks.get(x) == cur_u for x in exp)
+            if all_ok:
+                STATE[sym]["latest"] = None
+                STATE[sym]["updated_utc"] = None
+                cleared = True
+        else:
+            # non-strict mode: do NOT auto-clear (broadcast stays available)
+            # You can add a TTL cleaner later if desired.
+            cleared = False
 
     return {
         "ok": True,
         "symbol": sym,
-        "ack": updated_utc,
-        "cleared_latest": STATE[sym]["latest"] is None,
+        "consumer": c,
+        "ack": u,
+        "cleared_latest": cleared,
+        "expected_consumers": expected_consumers_for(sym),
+        "acks_count": len(STATE[sym].get("acks", {})),
     }
 
-# =========================
-# DEBUG (optional, hilfreich)
-# =========================
 @app.get("/debug/state")
 def debug_state():
-    return {
-        sym: {
-            "latest": v["latest"],
-            "updated_utc": v["updated_utc"],
-            "ack": v["ack"],
-            "queue_len": len(v["queue"]),
+    out = {}
+    for sym, v in STATE.items():
+        out[sym] = {
+            "updated_utc": v.get("updated_utc"),
+            "latest": v.get("latest"),
+            "acks": v.get("acks", {}),
+            "expected_consumers": expected_consumers_for(sym),
+            "queue_len": len(v.get("queue", [])),
         }
-        for sym, v in STATE.items()
-    }
+    return out
