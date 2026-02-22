@@ -35,7 +35,6 @@ class DealEvent(BaseModel):
         extra = "allow"
         allow_population_by_field_name = True
 
-    # Your base fields
     account: Optional[str] = None
     symbol: str
     magic: Optional[int] = None
@@ -61,7 +60,7 @@ class DealEvent(BaseModel):
     risk_usd: Optional[float] = None
     r_multiple: Optional[float] = None
 
-    # MT5 sender alias fields (accepted too)
+    # MT5 sender alias fields
     account_login: Optional[str] = Field(default=None, alias="account_login")
     server: Optional[str] = Field(default=None, alias="server")
     entry: Optional[str] = Field(default=None, alias="entry")
@@ -206,6 +205,43 @@ def head_root():
     return
 
 # =====================================================
+# HEALTH / MONITORING
+# =====================================================
+@app.get("/health")
+def health():
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        deals_count = int(cur.execute("SELECT COUNT(1) AS c FROM deals").fetchone()["c"])
+        risks_count = int(cur.execute("SELECT COUNT(1) AS c FROM risks").fetchone()["c"])
+
+        last_deal = cur.execute(
+            "SELECT received_utc, symbol FROM deals ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        last_risk = cur.execute(
+            "SELECT received_utc, symbol FROM risks ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+        conn.close()
+
+    return {
+        "ok": True,
+        "db_path": DB_PATH,
+        "counts": {
+            "deals": deals_count,
+            "risks": risks_count
+        },
+        "last": {
+            "deal_received_utc": (last_deal["received_utc"] if last_deal else None),
+            "deal_symbol": (last_deal["symbol"] if last_deal else None),
+            "risk_received_utc": (last_risk["received_utc"] if last_risk else None),
+            "risk_symbol": (last_risk["symbol"] if last_risk else None)
+        },
+        "time_utc": now_utc()
+    }
+
+# =====================================================
 # TRADINGVIEW → SIGNAL INGEST
 # =====================================================
 @app.post("/tv")
@@ -330,6 +366,27 @@ def ingest_risk(r: RiskSnapshot):
         conn.close()
 
     return {"ok": True, "received_utc": received, "symbol": sym, "position_id": pos_id, "risk_usd": float(r.risk_usd)}
+
+@app.get("/risks")
+def list_risks(symbol: Optional[str] = None, limit: int = 200):
+    limit = max(1, min(int(limit), 2000))
+    sym = norm_symbol(symbol) if symbol else None
+
+    with _db_lock:
+        conn = db_conn()
+        if sym:
+            rows = conn.execute(
+                "SELECT * FROM risks WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+                (sym, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM risks ORDER BY id DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        conn.close()
+
+    return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
 # MT5 → DEAL INGEST (CLOSE) + AUTO-R
@@ -742,5 +799,5 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
         "filters": {"symbol": sym, "limit": limit},
         "last_deals": [dict(r) for r in rows],
         "signals": sigs,
-        "note": "R: POST /risk at entry; /deal at close auto computes r_multiple via position_id."
+        "note": "R: POST /risk at entry (position_id); /deal at close auto computes r_multiple via position_id."
     }
