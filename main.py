@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from collections import deque
 import sqlite3
 import os
@@ -30,11 +30,17 @@ class TVSignal(BaseModel):
     id: Optional[str] = None
 
 class DealEvent(BaseModel):
+    # Fix: accept extra fields from MT5 sender -> no more 422 extra_forbidden
+    class Config:
+        extra = "allow"
+        allow_population_by_field_name = True
+
+    # Your original fields (kept)
     account: Optional[str] = None
     symbol: str
     magic: Optional[int] = None
     ticket: Optional[int] = None
-    deal_id: Optional[int] = None
+    deal_id: Optional[str] = None   # accept string or int-like (normalize later)
     type: str  # BUY / SELL
     lots: Optional[float] = None
 
@@ -51,9 +57,17 @@ class DealEvent(BaseModel):
     swap: Optional[float] = None
     comment: Optional[str] = None
 
-    # NEW: Risk / R-multiple (optional, coming from EA inputs)
+    # Risk / R-multiple (optional)
     risk_usd: Optional[float] = None
     r_multiple: Optional[float] = None
+
+    # Accept MT5 sender field names too
+    account_login: Optional[str] = Field(default=None, alias="account_login")
+    server: Optional[str] = Field(default=None, alias="server")
+    entry: Optional[str] = Field(default=None, alias="entry")
+    deal_time: Optional[str] = Field(default=None, alias="deal_time")
+    price: Optional[float] = Field(default=None, alias="price")
+    position_id: Optional[str] = Field(default=None, alias="position_id")
 
 # =====================================================
 # STATE (Signals in-memory)
@@ -99,7 +113,7 @@ def db_init() -> None:
             symbol TEXT NOT NULL,
             magic INTEGER,
             ticket INTEGER,
-            deal_id INTEGER,
+            deal_id TEXT,
             type TEXT NOT NULL,
             lots REAL,
             open_time TEXT,
@@ -112,7 +126,6 @@ def db_init() -> None:
             commission REAL,
             swap REAL,
             comment TEXT,
-
             risk_usd REAL,
             r_multiple REAL
         )
@@ -122,13 +135,6 @@ def db_init() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_symbol_time ON deals(symbol, close_time)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_magic ON deals(magic)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_deal_id ON deals(deal_id)")
-
-        # Auto-migration (safe if column already exists)
-        for col in ["risk_usd", "r_multiple"]:
-            try:
-                cur.execute(f"ALTER TABLE deals ADD COLUMN {col} REAL")
-            except Exception:
-                pass
 
         conn.commit()
         conn.close()
@@ -221,10 +227,21 @@ def ack_status(symbol: str):
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
 
 # =====================================================
-# MT5 → DEAL INGEST
+# MT5 → DEAL INGEST (FIXED)
+# - Accepts object OR list (fixes loc ["body","0"])
+# - Accepts extra fields (fixes extra_forbidden)
+# - Maps MT5 sender fields to DB schema
 # =====================================================
 @app.post("/deal")
-def ingest_deal(d: DealEvent):
+def ingest_deal(payload: Union[DealEvent, List[DealEvent]]):
+    d: DealEvent
+    if isinstance(payload, list):
+        if len(payload) < 1:
+            raise HTTPException(status_code=400, detail="empty deal list")
+        d = payload[0]
+    else:
+        d = payload
+
     sym = norm_symbol(d.symbol)
     typ = norm_action(d.type)
 
@@ -235,13 +252,28 @@ def ingest_deal(d: DealEvent):
 
     received = now_utc()
 
-    # Optional: dedup if deal_id exists (avoid duplicates if EA retries)
+    # account: prefer your field, else MT5 account_login
+    account = d.account or d.account_login
+
+    # close_time/close_price fall back to MT5 deal_time/price
+    close_time = d.close_time or d.deal_time
+    close_price = d.close_price if d.close_price is not None else d.price
+
+    # normalize deal_id to string
+    deal_id_norm: Optional[str] = None
+    if d.deal_id is not None:
+        deal_id_norm = str(d.deal_id).strip() or None
+
     with _db_lock:
         conn = db_conn()
         cur = conn.cursor()
 
-        if d.deal_id is not None:
-            row = cur.execute("SELECT id FROM deals WHERE deal_id = ? LIMIT 1", (int(d.deal_id),)).fetchone()
+        # Dedup if deal_id exists
+        if deal_id_norm is not None:
+            row = cur.execute(
+                "SELECT id FROM deals WHERE deal_id = ? LIMIT 1",
+                (deal_id_norm,)
+            ).fetchone()
             if row is not None:
                 conn.close()
                 return {"ok": True, "dedup": True, "id": int(row["id"]), "received_utc": received, "symbol": sym}
@@ -254,8 +286,8 @@ def ingest_deal(d: DealEvent):
                 risk_usd, r_multiple
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            received, d.account, sym, d.magic, d.ticket, d.deal_id, typ, d.lots,
-            d.open_time, d.close_time, d.open_price, d.close_price, d.sl, d.tp,
+            received, account, sym, d.magic, d.ticket, deal_id_norm, typ, d.lots,
+            d.open_time, close_time, d.open_price, close_price, d.sl, d.tp,
             d.profit, d.commission, d.swap, d.comment,
             d.risk_usd, d.r_multiple
         ))
@@ -498,10 +530,18 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
     sigs = {}
     if sym:
         if sym in STATE:
-            sigs[sym] = {"latest": STATE[sym].get("latest"), "updated_utc": STATE[sym].get("updated_utc"), "ack": STATE[sym].get("ack")}
+            sigs[sym] = {
+                "latest": STATE[sym].get("latest"),
+                "updated_utc": STATE[sym].get("updated_utc"),
+                "ack": STATE[sym].get("ack")
+            }
     else:
         for s in list(STATE.keys())[:50]:
-            sigs[s] = {"latest": STATE[s].get("latest"), "updated_utc": STATE[s].get("updated_utc"), "ack": STATE[s].get("ack")}
+            sigs[s] = {
+                "latest": STATE[s].get("latest"),
+                "updated_utc": STATE[s].get("updated_utc"),
+                "ack": STATE[s].get("ack")
+            }
 
     return {
         "filters": {"symbol": sym, "limit": limit},
