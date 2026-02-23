@@ -6,7 +6,6 @@ from collections import deque
 import sqlite3
 import os
 from threading import Lock
-import math
 
 app = FastAPI(title="Signal Agent API")
 
@@ -39,7 +38,7 @@ class DealEvent(BaseModel):
     ticket: Optional[int] = None
     deal_id: Optional[int] = None
 
-    # NEW: Join key to /risk
+    # IMPORTANT: join key to risks
     position_id: Optional[str] = None
 
     type: str  # BUY / SELL
@@ -58,7 +57,7 @@ class DealEvent(BaseModel):
     swap: Optional[float] = None
     comment: Optional[str] = None
 
-    # Optional: can be provided by EA, but we also compute server-side if possible
+    # Optional from EA; server can compute if missing and position_id matches a risk snapshot
     risk_usd: Optional[float] = None
     r_multiple: Optional[float] = None
 
@@ -125,7 +124,6 @@ def db_init() -> None:
             ticket INTEGER,
             deal_id INTEGER,
 
-            -- NEW: join to risks
             position_id TEXT,
 
             type TEXT NOT NULL,
@@ -149,13 +147,12 @@ def db_init() -> None:
         )
         """)
 
-        # indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_symbol_time ON deals(symbol, close_time)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_magic ON deals(magic)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_deal_id ON deals(deal_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_posid ON deals(position_id)")
 
-        # auto-migration
+        # auto-migration (safe if already exists)
         for col, ddl in [
             ("risk_usd", "REAL"),
             ("r_multiple", "REAL"),
@@ -246,11 +243,7 @@ def latest(symbol: str):
     sym = norm_symbol(symbol)
     if sym not in STATE or STATE[sym]["latest"] is None:
         return {"symbol": sym, "signal": None, "updated_utc": None}
-    return {
-        "symbol": sym,
-        "signal": STATE[sym]["latest"],
-        "updated_utc": STATE[sym]["updated_utc"]
-    }
+    return {"symbol": sym, "signal": STATE[sym]["latest"], "updated_utc": STATE[sym]["updated_utc"]}
 
 @app.get("/queue")
 def queue(symbol: str):
@@ -272,7 +265,7 @@ def ack(symbol: str, updated_utc: str):
     updated_utc = updated_utc.strip()
     STATE[sym]["ack"] = updated_utc
 
-    # If ACK matches current latest -> clear latest (single-consumer semantics)
+    # If ACK matches current latest -> clear latest
     if STATE[sym].get("updated_utc") == updated_utc:
         STATE[sym]["latest"] = None
         STATE[sym]["updated_utc"] = None
@@ -287,16 +280,18 @@ def ack_status(symbol: str):
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
 
 # =====================================================
-# MT5 → RISK INGEST (Step 7.3 foundation)
+# MT5 → RISK INGEST
 # =====================================================
 @app.post("/risk")
 def ingest_risk(r: RiskEvent):
     sym = norm_symbol(r.symbol)
     if not sym or sym == "0":
         raise HTTPException(status_code=400, detail="bad symbol")
+
     posid = (r.position_id or "").strip()
     if not posid or posid == "0":
         raise HTTPException(status_code=400, detail="bad position_id")
+
     if int(r.magic) == 0:
         raise HTTPException(status_code=400, detail="bad magic")
 
@@ -306,7 +301,7 @@ def ingest_risk(r: RiskEvent):
         conn = db_conn()
         cur = conn.cursor()
 
-        # dedup: 1 snapshot per position_id (EA retry safe)
+        # Dedup: 1 snapshot per position_id
         row = cur.execute("SELECT id FROM risks WHERE position_id = ? LIMIT 1", (posid,)).fetchone()
         if row is not None:
             conn.close()
@@ -350,9 +345,9 @@ def list_risks(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
-# MT5 → DEAL INGEST (Step 7)
+# MT5 → DEAL INGEST + server-side R compute (if possible)
 # =====================================================
-def _net_profit(d: DealEvent) -> float:
+def _net_profit_from_deal(d: DealEvent) -> float:
     return float((d.profit or 0.0) + (d.commission or 0.0) + (d.swap or 0.0))
 
 def _fetch_risk_usd_by_position_id(conn: sqlite3.Connection, posid: str) -> Optional[float]:
@@ -388,21 +383,23 @@ def ingest_deal(d: DealEvent):
         conn = db_conn()
         cur = conn.cursor()
 
-        # Optional: dedup if deal_id exists (avoid duplicates if EA retries)
+        # dedup by deal_id if present
         if d.deal_id is not None:
             row = cur.execute("SELECT id FROM deals WHERE deal_id = ? LIMIT 1", (int(d.deal_id),)).fetchone()
             if row is not None:
                 conn.close()
                 return {"ok": True, "dedup": True, "id": int(row["id"]), "received_utc": received, "symbol": sym}
 
-        # compute risk_usd/r_multiple if missing and we have position_id
-        net = _net_profit(d)
+        net = _net_profit_from_deal(d)
+
         risk = d.risk_usd
         rmult = d.r_multiple
 
+        # compute risk from risks table if missing
         if (risk is None or float(risk) <= 0.0) and posid:
             risk = _fetch_risk_usd_by_position_id(conn, posid)
 
+        # compute r_multiple if possible
         if rmult is None and (risk is not None) and float(risk) > 0.0:
             rmult = float(net) / float(risk)
 
@@ -445,10 +442,210 @@ def list_deals(symbol: Optional[str] = None, limit: int = 200):
             ).fetchall()
         conn.close()
 
-    return {"items": [dict(r) for r in rows], "count": len(rows)}
+    return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
-# KPI HELPERS (USD PnL, old gates)
+# RE-CALC ROUTE: robust against ordering (Deal before Risk)
+# =====================================================
+def _recalc_r_core(symbol: Optional[str], limit: int) -> Dict[str, Any]:
+    sym = norm_symbol(symbol) if symbol else None
+    limit = max(1, min(int(limit), 50000))
+
+    updated = 0
+    skipped = 0
+    missing_pos = 0
+    missing_risk = 0
+
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        if sym:
+            deals = cur.execute(
+                """
+                SELECT id, symbol, position_id, profit, commission, swap, risk_usd, r_multiple
+                FROM deals
+                WHERE symbol = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (sym, limit)
+            ).fetchall()
+        else:
+            deals = cur.execute(
+                """
+                SELECT id, symbol, position_id, profit, commission, swap, risk_usd, r_multiple
+                FROM deals
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,)
+            ).fetchall()
+
+        for d in deals:
+            deal_row_id = int(d["id"])
+            posid = (d["position_id"] or "").strip()
+
+            if not posid:
+                missing_pos += 1
+                continue
+
+            net = float((d["profit"] or 0.0) + (d["commission"] or 0.0) + (d["swap"] or 0.0))
+
+            has_rmult = d["r_multiple"] is not None
+            has_risk = d["risk_usd"] is not None and float(d["risk_usd"] or 0.0) > 0.0
+            if has_rmult and has_risk:
+                skipped += 1
+                continue
+
+            rrow = cur.execute(
+                "SELECT risk_usd FROM risks WHERE position_id = ? ORDER BY id DESC LIMIT 1",
+                (posid,)
+            ).fetchone()
+
+            if rrow is None or rrow["risk_usd"] is None:
+                missing_risk += 1
+                continue
+
+            try:
+                risk = float(rrow["risk_usd"])
+            except Exception:
+                missing_risk += 1
+                continue
+
+            if risk <= 0:
+                missing_risk += 1
+                continue
+
+            rmult = net / risk
+
+            cur.execute(
+                "UPDATE deals SET risk_usd = ?, r_multiple = ? WHERE id = ?",
+                (risk, rmult, deal_row_id)
+            )
+            updated += 1
+
+        conn.commit()
+        conn.close()
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "limit": limit,
+        "updated": updated,
+        "skipped_already_ok": skipped,
+        "missing_position_id": missing_pos,
+        "missing_risk_snapshot": missing_risk,
+        "note": "Safe to repeat. Use after risks arrive or anytime."
+    }
+
+@app.get("/recalc_r")
+def recalc_r_get(symbol: Optional[str] = None, limit: int = 5000):
+    return _recalc_r_core(symbol, limit)
+
+@app.post("/recalc_r")
+def recalc_r_post(symbol: Optional[str] = None, limit: int = 5000):
+    return _recalc_r_core(symbol, limit)
+
+# =====================================================
+# JOIN DEBUG ROUTE
+# =====================================================
+@app.get("/join_check")
+def join_check(symbol: str, limit: int = 20):
+    """
+    Debug endpoint to verify that position_id in /risk matches position_id in /deal.
+    Shows last N risks and last N deals for the symbol plus a join preview.
+    """
+    sym = norm_symbol(symbol)
+    limit = max(1, min(int(limit), 200))
+
+    with _db_lock:
+        conn = db_conn()
+
+        risks = conn.execute(
+            """
+            SELECT id, received_utc, symbol, position_id, magic, open_time, entry_price, sl, lots, risk_usd, source
+            FROM risks
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (sym, limit)
+        ).fetchall()
+
+        deals = conn.execute(
+            """
+            SELECT id, received_utc, symbol, position_id, deal_id, ticket, magic, type, close_time,
+                   profit, commission, swap, risk_usd, r_multiple, comment
+            FROM deals
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (sym, limit)
+        ).fetchall()
+
+        joined = conn.execute(
+            """
+            SELECT
+              d.id                 AS deal_row_id,
+              d.deal_id            AS deal_id,
+              d.position_id        AS deal_position_id,
+              d.close_time         AS close_time,
+              (COALESCE(d.profit,0)+COALESCE(d.commission,0)+COALESCE(d.swap,0)) AS net_profit,
+              d.risk_usd           AS deal_risk_usd,
+              d.r_multiple         AS deal_r_multiple,
+              r.id                 AS risk_row_id,
+              r.risk_usd           AS risk_risk_usd,
+              r.open_time          AS risk_open_time,
+              r.source             AS risk_source
+            FROM deals d
+            LEFT JOIN risks r
+              ON r.position_id = d.position_id
+            WHERE d.symbol = ?
+            ORDER BY d.id DESC
+            LIMIT ?
+            """,
+            (sym, limit)
+        ).fetchall()
+
+        conn.close()
+
+    risk_posids = set((r["position_id"] or "").strip() for r in risks if (r["position_id"] or "").strip())
+    deal_posids = set((d["position_id"] or "").strip() for d in deals if (d["position_id"] or "").strip())
+
+    intersection = sorted(list(risk_posids.intersection(deal_posids)))
+    only_risks = sorted(list(risk_posids - deal_posids))
+    only_deals = sorted(list(deal_posids - risk_posids))
+
+    return {
+        "symbol": sym,
+        "limit": limit,
+        "counts": {
+            "risks": len(risks),
+            "deals": len(deals),
+            "risk_posids": len(risk_posids),
+            "deal_posids": len(deal_posids),
+            "matching_posids": len(intersection),
+            "only_in_risks": len(only_risks),
+            "only_in_deals": len(only_deals),
+        },
+        "matching_posids_sample": intersection[:10],
+        "only_in_risks_sample": only_risks[:10],
+        "only_in_deals_sample": only_deals[:10],
+        "last_risks": [dict(x) for x in risks],
+        "last_deals": [dict(x) for x in deals],
+        "join_preview": [dict(x) for x in joined],
+        "tips": [
+            "matching_posids should grow after EA entries + deal closes.",
+            "If deals have position_id but risks are empty -> /risk not sent yet (no EA entries).",
+            "If risks have posid but deals missing -> deal sender not sending position_id or close deals not yet occurred.",
+            "If both exist but do not match -> you're using different identifiers (POSITION_IDENTIFIER vs DEAL_POSITION_ID mismatch)."
+        ]
+    }
+
+# =====================================================
+# USD KPI HELPERS (legacy)
 # =====================================================
 def _pnl_row(r: sqlite3.Row) -> float:
     return float((r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0))
@@ -540,7 +737,7 @@ def _today_pnl(symbol: str) -> float:
     return float(sum(_pnl_row(r) for r in rows))
 
 # =====================================================
-# KPIs (USD / legacy)
+# KPIs (USD)
 # =====================================================
 @app.get("/kpis/rolling")
 def kpis_rolling(symbol: str, n: int = 20):
@@ -597,10 +794,8 @@ def status_propfirma(
         reasons.append(f"NetLast{int(n)}<{net_last_n_min}")
     if int(loss_streak) > int(loss_streak_max):
         reasons.append(f"LossStreak>{int(loss_streak_max)}")
-
     if today_net <= -abs(float(daily_dd_limit)):
         reasons.append(f"DailyPnL<={-abs(float(daily_dd_limit))}")
-
     if total_max_dd > abs(float(total_dd_limit)):
         reasons.append(f"TotalMaxDD>{abs(float(total_dd_limit))}")
 
@@ -761,6 +956,7 @@ def status_propfirma_r(
 
     reasons: List[str] = []
 
+    # Minimum trades with R before we can trust the gate
     if len(rs_last) < max(5, int(n) // 2):
         reasons.append("Not enough R data yet")
 
@@ -836,17 +1032,25 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
             ).fetchall()
         conn.close()
 
-    sigs = {}
+    sigs: Dict[str, Any] = {}
     if sym:
         if sym in STATE:
-            sigs[sym] = {"latest": STATE[sym].get("latest"), "updated_utc": STATE[sym].get("updated_utc"), "ack": STATE[sym].get("ack")}
+            sigs[sym] = {
+                "latest": STATE[sym].get("latest"),
+                "updated_utc": STATE[sym].get("updated_utc"),
+                "ack": STATE[sym].get("ack")
+            }
     else:
         for s in list(STATE.keys())[:50]:
-            sigs[s] = {"latest": STATE[s].get("latest"), "updated_utc": STATE[s].get("updated_utc"), "ack": STATE[s].get("ack")}
+            sigs[s] = {
+                "latest": STATE[s].get("latest"),
+                "updated_utc": STATE[s].get("updated_utc"),
+                "ack": STATE[s].get("ack")
+            }
 
     return {
         "filters": {"symbol": sym, "limit": limit},
         "last_deals": [dict(r) for r in rows],
         "signals": sigs,
-        "note": "Gate is per symbol. /status/propfirm_r?symbol=BTCUSD or XAUUSD"
+        "note": "R-Gate is per symbol. /status/propfirm_r?symbol=BTCUSD or XAUUSD"
     }
