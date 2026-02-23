@@ -57,7 +57,6 @@ class DealEvent(BaseModel):
     swap: Optional[float] = None
     comment: Optional[str] = None
 
-    # Optional from EA; server can compute if missing and position_id matches a risk snapshot
     risk_usd: Optional[float] = None
     r_multiple: Optional[float] = None
 
@@ -112,7 +111,6 @@ def db_init() -> None:
         conn = db_conn()
         cur = conn.cursor()
 
-        # Deals
         cur.execute("""
         CREATE TABLE IF NOT EXISTS deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,7 +150,7 @@ def db_init() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_deal_id ON deals(deal_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_posid ON deals(position_id)")
 
-        # auto-migration (safe if already exists)
+        # Safe migrations
         for col, ddl in [
             ("risk_usd", "REAL"),
             ("r_multiple", "REAL"),
@@ -265,7 +263,6 @@ def ack(symbol: str, updated_utc: str):
     updated_utc = updated_utc.strip()
     STATE[sym]["ack"] = updated_utc
 
-    # If ACK matches current latest -> clear latest
     if STATE[sym].get("updated_utc") == updated_utc:
         STATE[sym]["latest"] = None
         STATE[sym]["updated_utc"] = None
@@ -301,7 +298,6 @@ def ingest_risk(r: RiskEvent):
         conn = db_conn()
         cur = conn.cursor()
 
-        # Dedup: 1 snapshot per position_id
         row = cur.execute("SELECT id FROM risks WHERE position_id = ? LIMIT 1", (posid,)).fetchone()
         if row is not None:
             conn.close()
@@ -345,7 +341,7 @@ def list_risks(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
-# MT5 → DEAL INGEST + server-side R compute (if possible)
+# MT5 → DEAL INGEST + server-side R compute
 # =====================================================
 def _net_profit_from_deal(d: DealEvent) -> float:
     return float((d.profit or 0.0) + (d.commission or 0.0) + (d.swap or 0.0))
@@ -383,7 +379,6 @@ def ingest_deal(d: DealEvent):
         conn = db_conn()
         cur = conn.cursor()
 
-        # dedup by deal_id if present
         if d.deal_id is not None:
             row = cur.execute("SELECT id FROM deals WHERE deal_id = ? LIMIT 1", (int(d.deal_id),)).fetchone()
             if row is not None:
@@ -395,11 +390,9 @@ def ingest_deal(d: DealEvent):
         risk = d.risk_usd
         rmult = d.r_multiple
 
-        # compute risk from risks table if missing
         if (risk is None or float(risk) <= 0.0) and posid:
             risk = _fetch_risk_usd_by_position_id(conn, posid)
 
-        # compute r_multiple if possible
         if rmult is None and (risk is not None) and float(risk) > 0.0:
             rmult = float(net) / float(risk)
 
@@ -445,7 +438,7 @@ def list_deals(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
-# RE-CALC ROUTE: robust against ordering (Deal before Risk)
+# RE-CALC ROUTE (GET + POST)
 # =====================================================
 def _recalc_r_core(symbol: Optional[str], limit: int) -> Dict[str, Any]:
     sym = norm_symbol(symbol) if symbol else None
@@ -463,7 +456,7 @@ def _recalc_r_core(symbol: Optional[str], limit: int) -> Dict[str, Any]:
         if sym:
             deals = cur.execute(
                 """
-                SELECT id, symbol, position_id, profit, commission, swap, risk_usd, r_multiple
+                SELECT id, position_id, profit, commission, swap, risk_usd, r_multiple
                 FROM deals
                 WHERE symbol = ?
                 ORDER BY id DESC
@@ -474,7 +467,7 @@ def _recalc_r_core(symbol: Optional[str], limit: int) -> Dict[str, Any]:
         else:
             deals = cur.execute(
                 """
-                SELECT id, symbol, position_id, profit, commission, swap, risk_usd, r_multiple
+                SELECT id, position_id, profit, commission, swap, risk_usd, r_multiple
                 FROM deals
                 ORDER BY id DESC
                 LIMIT ?
@@ -493,564 +486,4 @@ def _recalc_r_core(symbol: Optional[str], limit: int) -> Dict[str, Any]:
             net = float((d["profit"] or 0.0) + (d["commission"] or 0.0) + (d["swap"] or 0.0))
 
             has_rmult = d["r_multiple"] is not None
-            has_risk = d["risk_usd"] is not None and float(d["risk_usd"] or 0.0) > 0.0
-            if has_rmult and has_risk:
-                skipped += 1
-                continue
-
-            rrow = cur.execute(
-                "SELECT risk_usd FROM risks WHERE position_id = ? ORDER BY id DESC LIMIT 1",
-                (posid,)
-            ).fetchone()
-
-            if rrow is None or rrow["risk_usd"] is None:
-                missing_risk += 1
-                continue
-
-            try:
-                risk = float(rrow["risk_usd"])
-            except Exception:
-                missing_risk += 1
-                continue
-
-            if risk <= 0:
-                missing_risk += 1
-                continue
-
-            rmult = net / risk
-
-            cur.execute(
-                "UPDATE deals SET risk_usd = ?, r_multiple = ? WHERE id = ?",
-                (risk, rmult, deal_row_id)
-            )
-            updated += 1
-
-        conn.commit()
-        conn.close()
-
-    return {
-        "ok": True,
-        "symbol": sym,
-        "limit": limit,
-        "updated": updated,
-        "skipped_already_ok": skipped,
-        "missing_position_id": missing_pos,
-        "missing_risk_snapshot": missing_risk,
-        "note": "Safe to repeat. Use after risks arrive or anytime."
-    }
-
-@app.get("/recalc_r")
-def recalc_r_get(symbol: Optional[str] = None, limit: int = 5000):
-    return _recalc_r_core(symbol, limit)
-
-@app.post("/recalc_r")
-def recalc_r_post(symbol: Optional[str] = None, limit: int = 5000):
-    return _recalc_r_core(symbol, limit)
-
-# =====================================================
-# JOIN DEBUG ROUTE
-# =====================================================
-@app.get("/join_check")
-def join_check(symbol: str, limit: int = 20):
-    """
-    Debug endpoint to verify that position_id in /risk matches position_id in /deal.
-    Shows last N risks and last N deals for the symbol plus a join preview.
-    """
-    sym = norm_symbol(symbol)
-    limit = max(1, min(int(limit), 200))
-
-    with _db_lock:
-        conn = db_conn()
-
-        risks = conn.execute(
-            """
-            SELECT id, received_utc, symbol, position_id, magic, open_time, entry_price, sl, lots, risk_usd, source
-            FROM risks
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (sym, limit)
-        ).fetchall()
-
-        deals = conn.execute(
-            """
-            SELECT id, received_utc, symbol, position_id, deal_id, ticket, magic, type, close_time,
-                   profit, commission, swap, risk_usd, r_multiple, comment
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (sym, limit)
-        ).fetchall()
-
-        joined = conn.execute(
-            """
-            SELECT
-              d.id                 AS deal_row_id,
-              d.deal_id            AS deal_id,
-              d.position_id        AS deal_position_id,
-              d.close_time         AS close_time,
-              (COALESCE(d.profit,0)+COALESCE(d.commission,0)+COALESCE(d.swap,0)) AS net_profit,
-              d.risk_usd           AS deal_risk_usd,
-              d.r_multiple         AS deal_r_multiple,
-              r.id                 AS risk_row_id,
-              r.risk_usd           AS risk_risk_usd,
-              r.open_time          AS risk_open_time,
-              r.source             AS risk_source
-            FROM deals d
-            LEFT JOIN risks r
-              ON r.position_id = d.position_id
-            WHERE d.symbol = ?
-            ORDER BY d.id DESC
-            LIMIT ?
-            """,
-            (sym, limit)
-        ).fetchall()
-
-        conn.close()
-
-    risk_posids = set((r["position_id"] or "").strip() for r in risks if (r["position_id"] or "").strip())
-    deal_posids = set((d["position_id"] or "").strip() for d in deals if (d["position_id"] or "").strip())
-
-    intersection = sorted(list(risk_posids.intersection(deal_posids)))
-    only_risks = sorted(list(risk_posids - deal_posids))
-    only_deals = sorted(list(deal_posids - risk_posids))
-
-    return {
-        "symbol": sym,
-        "limit": limit,
-        "counts": {
-            "risks": len(risks),
-            "deals": len(deals),
-            "risk_posids": len(risk_posids),
-            "deal_posids": len(deal_posids),
-            "matching_posids": len(intersection),
-            "only_in_risks": len(only_risks),
-            "only_in_deals": len(only_deals),
-        },
-        "matching_posids_sample": intersection[:10],
-        "only_in_risks_sample": only_risks[:10],
-        "only_in_deals_sample": only_deals[:10],
-        "last_risks": [dict(x) for x in risks],
-        "last_deals": [dict(x) for x in deals],
-        "join_preview": [dict(x) for x in joined],
-        "tips": [
-            "matching_posids should grow after EA entries + deal closes.",
-            "If deals have position_id but risks are empty -> /risk not sent yet (no EA entries).",
-            "If risks have posid but deals missing -> deal sender not sending position_id or close deals not yet occurred.",
-            "If both exist but do not match -> you're using different identifiers (POSITION_IDENTIFIER vs DEAL_POSITION_ID mismatch)."
-        ]
-    }
-
-# =====================================================
-# USD KPI HELPERS (legacy)
-# =====================================================
-def _pnl_row(r: sqlite3.Row) -> float:
-    return float((r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0))
-
-def _fetch_pnls(symbol: str) -> List[float]:
-    sym = norm_symbol(symbol)
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(
-            """
-            SELECT profit, commission, swap
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id ASC
-            """,
-            (sym,)
-        ).fetchall()
-        conn.close()
-    return [_pnl_row(r) for r in rows]
-
-def _fetch_pnls_last_n(symbol: str, n: int) -> List[float]:
-    sym = norm_symbol(symbol)
-    n = max(1, min(int(n), 5000))
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(
-            """
-            SELECT profit, commission, swap
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (sym, n)
-        ).fetchall()
-        conn.close()
-    pnls = [_pnl_row(r) for r in rows]
-    pnls.reverse()
-    return pnls
-
-def _profit_factor(pnls: List[float]) -> Optional[float]:
-    gp = sum(x for x in pnls if x > 0)
-    gl = abs(sum(x for x in pnls if x < 0))
-    if gl <= 0:
-        return None
-    return gp / gl
-
-def _loss_streak(pnls: List[float]) -> int:
-    s = 0
-    for x in reversed(pnls):
-        if x < 0:
-            s += 1
-        else:
-            break
-    return s
-
-def _max_drawdown(pnls: List[float]) -> float:
-    peak = float("-inf")
-    eq = 0.0
-    max_dd = 0.0
-    for p in pnls:
-        eq += p
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-    return max_dd
-
-def _today_prefix_mt5() -> str:
-    # close_time stored by EA as "YYYY.MM.DD HH:MM:SS"
-    return datetime.now().strftime("%Y.%m.%d")
-
-def _today_pnl(symbol: str) -> float:
-    sym = norm_symbol(symbol)
-    pref = _today_prefix_mt5()
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(
-            """
-            SELECT profit, commission, swap
-            FROM deals
-            WHERE symbol = ?
-              AND close_time LIKE ?
-            """,
-            (sym, f"{pref}%")
-        ).fetchall()
-        conn.close()
-    return float(sum(_pnl_row(r) for r in rows))
-
-# =====================================================
-# KPIs (USD)
-# =====================================================
-@app.get("/kpis/rolling")
-def kpis_rolling(symbol: str, n: int = 20):
-    sym = norm_symbol(symbol)
-    pnls = _fetch_pnls_last_n(sym, n)
-
-    trades = len(pnls)
-    wins = sum(1 for x in pnls if x > 0)
-    losses = sum(1 for x in pnls if x < 0)
-    net = float(sum(pnls))
-    pf = _profit_factor(pnls)
-    streak = _loss_streak(pnls)
-    max_dd = _max_drawdown(pnls)
-
-    return {
-        "symbol": sym,
-        "n": int(n),
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "net_last_n": round(net, 2),
-        "profit_factor": (round(pf, 3) if pf is not None else None),
-        "loss_streak": int(streak),
-        "max_drawdown_last_n": round(max_dd, 2),
-    }
-
-@app.get("/status/propfirm")
-def status_propfirma(
-    symbol: str,
-    n: int = 20,
-    pf_min: float = 1.30,
-    net_last_n_min: float = -200.0,
-    loss_streak_max: int = 3,
-    daily_dd_limit: float = 350.0,
-    total_dd_limit: float = 600.0
-):
-    sym = norm_symbol(symbol)
-
-    pnls_last = _fetch_pnls_last_n(sym, n)
-    pf = _profit_factor(pnls_last)
-    net_last_n = float(sum(pnls_last))
-    loss_streak = _loss_streak(pnls_last)
-
-    today_net = _today_pnl(sym)
-
-    pnls_all = _fetch_pnls(sym)
-    total_max_dd = _max_drawdown(pnls_all)
-
-    reasons: List[str] = []
-
-    if pf is not None and float(pf) < float(pf_min):
-        reasons.append(f"PF<{pf_min}")
-    if net_last_n < float(net_last_n_min):
-        reasons.append(f"NetLast{int(n)}<{net_last_n_min}")
-    if int(loss_streak) > int(loss_streak_max):
-        reasons.append(f"LossStreak>{int(loss_streak_max)}")
-    if today_net <= -abs(float(daily_dd_limit)):
-        reasons.append(f"DailyPnL<={-abs(float(daily_dd_limit))}")
-    if total_max_dd > abs(float(total_dd_limit)):
-        reasons.append(f"TotalMaxDD>{abs(float(total_dd_limit))}")
-
-    level = "RED" if reasons else "GREEN"
-
-    return {
-        "symbol": sym,
-        "level": level,
-        "reasons": reasons,
-        "rolling": {
-            "n": int(n),
-            "profit_factor": (round(pf, 3) if pf is not None else None),
-            "net_last_n": round(net_last_n, 2),
-            "loss_streak": int(loss_streak),
-        },
-        "today": {"day": _today_prefix_mt5(), "net_profit": round(today_net, 2)},
-        "total": {"max_drawdown": round(total_max_dd, 2)},
-        "thresholds": {
-            "pf_min": float(pf_min),
-            "net_last_n_min": float(net_last_n_min),
-            "loss_streak_max": int(loss_streak_max),
-            "daily_dd_limit": -abs(float(daily_dd_limit)),
-            "total_dd_limit": abs(float(total_dd_limit)),
-        }
-    }
-
-# =====================================================
-# R-BASED KPIs + R-GATE (Step 8)
-# =====================================================
-def _fetch_rs(symbol: str) -> List[float]:
-    sym = norm_symbol(symbol)
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(
-            """
-            SELECT r_multiple
-            FROM deals
-            WHERE symbol = ?
-              AND r_multiple IS NOT NULL
-            ORDER BY id ASC
-            """,
-            (sym,)
-        ).fetchall()
-        conn.close()
-
-    out: List[float] = []
-    for r in rows:
-        v = r["r_multiple"]
-        if v is None:
-            continue
-        try:
-            out.append(float(v))
-        except Exception:
-            pass
-    return out
-
-def _fetch_rs_last_n(symbol: str, n: int) -> List[float]:
-    sym = norm_symbol(symbol)
-    n = max(1, min(int(n), 5000))
-    with _db_lock:
-        conn = db_conn()
-        rows = conn.execute(
-            """
-            SELECT r_multiple
-            FROM deals
-            WHERE symbol = ?
-              AND r_multiple IS NOT NULL
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (sym, n)
-        ).fetchall()
-        conn.close()
-
-    rs: List[float] = []
-    for r in rows:
-        v = r["r_multiple"]
-        if v is None:
-            continue
-        try:
-            rs.append(float(v))
-        except Exception:
-            pass
-    rs.reverse()
-    return rs
-
-def _profit_factor_r(rs: List[float]) -> Optional[float]:
-    gp = sum(x for x in rs if x > 0)
-    gl = abs(sum(x for x in rs if x < 0))
-    if gl <= 0:
-        return None
-    return gp / gl
-
-def _loss_streak_r(rs: List[float]) -> int:
-    s = 0
-    for x in reversed(rs):
-        if x < 0:
-            s += 1
-        else:
-            break
-    return s
-
-def _max_drawdown_r(rs: List[float]) -> float:
-    peak = float("-inf")
-    eq = 0.0
-    max_dd = 0.0
-    for r in rs:
-        eq += r
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-    return float(max_dd)
-
-@app.get("/kpis_r/rolling")
-def kpis_r_rolling(symbol: str, n: int = 20):
-    sym = norm_symbol(symbol)
-    rs = _fetch_rs_last_n(sym, n)
-
-    trades = len(rs)
-    wins = sum(1 for x in rs if x > 0)
-    losses = sum(1 for x in rs if x < 0)
-
-    net_r = float(sum(rs))
-    pf_r = _profit_factor_r(rs)
-    streak_r = _loss_streak_r(rs)
-    max_dd_r = _max_drawdown_r(rs)
-
-    return {
-        "symbol": sym,
-        "n": int(n),
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "net_r_last_n": round(net_r, 3),
-        "profit_factor_r": (round(pf_r, 3) if pf_r is not None else None),
-        "loss_streak_r": int(streak_r),
-        "max_drawdown_r_last_n": round(max_dd_r, 3),
-    }
-
-@app.get("/status/propfirm_r")
-def status_propfirma_r(
-    symbol: str,
-    n: int = 20,
-
-    pf_r_min: float = 1.20,
-    net_r_last_n_min: float = -3.0,
-    loss_streak_r_max: int = 3,
-
-    max_dd_r_limit: float = 6.0,
-    rolling_dd_r_limit: float = 4.0
-):
-    sym = norm_symbol(symbol)
-
-    rs_last = _fetch_rs_last_n(sym, n)
-    rs_all = _fetch_rs(sym)
-
-    reasons: List[str] = []
-
-    # Minimum trades with R before we can trust the gate
-    if len(rs_last) < max(5, int(n) // 2):
-        reasons.append("Not enough R data yet")
-
-    pf_r = _profit_factor_r(rs_last)
-    net_r_last = float(sum(rs_last))
-    streak_r = _loss_streak_r(rs_last)
-    rolling_dd_r = _max_drawdown_r(rs_last)
-    total_dd_r = _max_drawdown_r(rs_all) if len(rs_all) else 0.0
-
-    if pf_r is not None and float(pf_r) < float(pf_r_min):
-        reasons.append(f"PF_R<{pf_r_min}")
-    if net_r_last < float(net_r_last_n_min):
-        reasons.append(f"NetR_Last{int(n)}<{net_r_last_n_min}")
-    if int(streak_r) > int(loss_streak_r_max):
-        reasons.append(f"LossStreakR>{int(loss_streak_r_max)}")
-    if float(rolling_dd_r) > float(rolling_dd_r_limit):
-        reasons.append(f"RollingDD_R>{rolling_dd_r_limit}")
-    if float(total_dd_r) > float(max_dd_r_limit):
-        reasons.append(f"TotalMaxDD_R>{max_dd_r_limit}")
-
-    if reasons:
-        if len(reasons) == 1 and reasons[0] == "Not enough R data yet":
-            level = "YELLOW"
-        else:
-            level = "RED"
-    else:
-        level = "GREEN"
-
-    return {
-        "symbol": sym,
-        "level": level,
-        "reasons": reasons,
-        "rolling": {
-            "n": int(n),
-            "trades_with_r": int(len(rs_last)),
-            "profit_factor_r": (round(pf_r, 3) if pf_r is not None else None),
-            "net_r_last_n": round(net_r_last, 3),
-            "loss_streak_r": int(streak_r),
-            "rolling_dd_r": round(rolling_dd_r, 3),
-        },
-        "total": {
-            "trades_with_r": int(len(rs_all)),
-            "total_max_dd_r": round(total_dd_r, 3),
-        },
-        "thresholds": {
-            "pf_r_min": float(pf_r_min),
-            "net_r_last_n_min": float(net_r_last_n_min),
-            "loss_streak_r_max": int(loss_streak_r_max),
-            "rolling_dd_r_limit": float(rolling_dd_r_limit),
-            "max_dd_r_limit": float(max_dd_r_limit),
-        }
-    }
-
-# =====================================================
-# SUMMARY
-# =====================================================
-@app.get("/summary")
-def summary(symbol: Optional[str] = None, limit: int = 20):
-    limit = max(1, min(int(limit), 200))
-    sym = norm_symbol(symbol) if symbol else None
-
-    with _db_lock:
-        conn = db_conn()
-        if sym:
-            rows = conn.execute(
-                "SELECT * FROM deals WHERE symbol = ? ORDER BY id DESC LIMIT ?",
-                (sym, limit)
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM deals ORDER BY id DESC LIMIT ?",
-                (limit,)
-            ).fetchall()
-        conn.close()
-
-    sigs: Dict[str, Any] = {}
-    if sym:
-        if sym in STATE:
-            sigs[sym] = {
-                "latest": STATE[sym].get("latest"),
-                "updated_utc": STATE[sym].get("updated_utc"),
-                "ack": STATE[sym].get("ack")
-            }
-    else:
-        for s in list(STATE.keys())[:50]:
-            sigs[s] = {
-                "latest": STATE[s].get("latest"),
-                "updated_utc": STATE[s].get("updated_utc"),
-                "ack": STATE[s].get("ack")
-            }
-
-    return {
-        "filters": {"symbol": sym, "limit": limit},
-        "last_deals": [dict(r) for r in rows],
-        "signals": sigs,
-        "note": "R-Gate is per symbol. /status/propfirm_r?symbol=BTCUSD or XAUUSD"
-    }
+            has_risk = d["risk_usd"] is not None and float(d["risk_usd"] or
