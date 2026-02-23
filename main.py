@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List
 from collections import deque
 import sqlite3
 import os
 from threading import Lock
+import math
 
 app = FastAPI(title="Signal Agent API")
 
@@ -29,17 +30,18 @@ class TVSignal(BaseModel):
     ts: Optional[str] = None
     id: Optional[str] = None
 
-class DealEvent(BaseModel):
-    # Accept extra fields from MT5 sender (prevents 422 extra_forbidden)
-    class Config:
-        extra = "allow"
-        allow_population_by_field_name = True
 
+class DealEvent(BaseModel):
     account: Optional[str] = None
     symbol: str
+
     magic: Optional[int] = None
     ticket: Optional[int] = None
-    deal_id: Optional[str] = None
+    deal_id: Optional[int] = None
+
+    # NEW: Join key to /risk
+    position_id: Optional[str] = None
+
     type: str  # BUY / SELL
     lots: Optional[float] = None
 
@@ -56,30 +58,24 @@ class DealEvent(BaseModel):
     swap: Optional[float] = None
     comment: Optional[str] = None
 
-    # Risk / R (optional; API will auto-fill if missing)
+    # Optional: can be provided by EA, but we also compute server-side if possible
     risk_usd: Optional[float] = None
     r_multiple: Optional[float] = None
 
-    # MT5 sender alias fields
-    account_login: Optional[str] = Field(default=None, alias="account_login")
-    server: Optional[str] = Field(default=None, alias="server")
-    entry: Optional[str] = Field(default=None, alias="entry")
-    deal_time: Optional[str] = Field(default=None, alias="deal_time")
-    price: Optional[float] = Field(default=None, alias="price")
-    position_id: Optional[str] = Field(default=None, alias="position_id")
 
-class RiskSnapshot(BaseModel):
-    class Config:
-        extra = "allow"
-
+class RiskEvent(BaseModel):
+    account: Optional[str] = None
     symbol: str
     position_id: str
-    magic: Optional[int] = None
+    magic: int
+
     open_time: Optional[str] = None
     entry_price: Optional[float] = None
     sl: Optional[float] = None
     lots: Optional[float] = None
-    risk_usd: float
+    risk_usd: Optional[float] = None
+    source: Optional[str] = None
+
 
 # =====================================================
 # STATE (Signals in-memory)
@@ -112,38 +108,42 @@ def db_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
-def _col_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
-    return any(r["name"] == col for r in rows)
-
 def db_init() -> None:
     with _db_lock:
         conn = db_conn()
         cur = conn.cursor()
 
-        # --- deals table (extended) ---
+        # Deals
         cur.execute("""
         CREATE TABLE IF NOT EXISTS deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             received_utc TEXT NOT NULL,
             account TEXT,
             symbol TEXT NOT NULL,
+
             magic INTEGER,
             ticket INTEGER,
-            deal_id TEXT,
+            deal_id INTEGER,
+
+            -- NEW: join to risks
             position_id TEXT,
+
             type TEXT NOT NULL,
             lots REAL,
+
             open_time TEXT,
             close_time TEXT,
             open_price REAL,
             close_price REAL,
+
             sl REAL,
             tp REAL,
+
             profit REAL,
             commission REAL,
             swap REAL,
             comment TEXT,
+
             risk_usd REAL,
             r_multiple REAL
         )
@@ -153,38 +153,47 @@ def db_init() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_symbol_time ON deals(symbol, close_time)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_magic ON deals(magic)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_deal_id ON deals(deal_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_pos_id ON deals(position_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_posid ON deals(position_id)")
 
-        # safe migrations (only if missing)
-        for col, typ in [
-            ("deal_id", "TEXT"),
-            ("position_id", "TEXT"),
+        # auto-migration
+        for col, ddl in [
             ("risk_usd", "REAL"),
             ("r_multiple", "REAL"),
+            ("position_id", "TEXT"),
         ]:
             try:
-                if not _col_exists(cur, "deals", col):
-                    cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {typ}")
+                cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {ddl}")
             except Exception:
                 pass
 
-        # --- risks table (position_id -> initial risk) ---
+        conn.commit()
+        conn.close()
+
+def db_init_risks() -> None:
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS risks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             received_utc TEXT NOT NULL,
+            account TEXT,
             symbol TEXT NOT NULL,
             position_id TEXT NOT NULL,
-            magic INTEGER,
+            magic INTEGER NOT NULL,
+
             open_time TEXT,
             entry_price REAL,
             sl REAL,
             lots REAL,
-            risk_usd REAL NOT NULL
+            risk_usd REAL,
+            source TEXT
         )
         """)
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_risks_pos ON risks(position_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_symbol ON risks(symbol)")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_symbol_time ON risks(symbol, open_time)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_posid ON risks(position_id)")
 
         conn.commit()
         conn.close()
@@ -192,6 +201,7 @@ def db_init() -> None:
 @app.on_event("startup")
 def _startup():
     db_init()
+    db_init_risks()
 
 # =====================================================
 # ROOT
@@ -203,43 +213,6 @@ def root():
 @app.head("/")
 def head_root():
     return
-
-# =====================================================
-# HEALTH / MONITORING
-# =====================================================
-@app.get("/health")
-def health():
-    with _db_lock:
-        conn = db_conn()
-        cur = conn.cursor()
-
-        deals_count = int(cur.execute("SELECT COUNT(1) AS c FROM deals").fetchone()["c"])
-        risks_count = int(cur.execute("SELECT COUNT(1) AS c FROM risks").fetchone()["c"])
-
-        last_deal = cur.execute(
-            "SELECT received_utc, symbol FROM deals ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        last_risk = cur.execute(
-            "SELECT received_utc, symbol FROM risks ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-
-        conn.close()
-
-    return {
-        "ok": True,
-        "db_path": DB_PATH,
-        "counts": {
-            "deals": deals_count,
-            "risks": risks_count
-        },
-        "last": {
-            "deal_received_utc": (last_deal["received_utc"] if last_deal else None),
-            "deal_symbol": (last_deal["symbol"] if last_deal else None),
-            "risk_received_utc": (last_risk["received_utc"] if last_risk else None),
-            "risk_symbol": (last_risk["symbol"] if last_risk else None)
-        },
-        "time_utc": now_utc()
-    }
 
 # =====================================================
 # TRADINGVIEW → SIGNAL INGEST
@@ -299,7 +272,7 @@ def ack(symbol: str, updated_utc: str):
     updated_utc = updated_utc.strip()
     STATE[sym]["ack"] = updated_utc
 
-    # If ACK matches current latest -> clear latest
+    # If ACK matches current latest -> clear latest (single-consumer semantics)
     if STATE[sym].get("updated_utc") == updated_utc:
         STATE[sym]["latest"] = None
         STATE[sym]["updated_utc"] = None
@@ -314,19 +287,18 @@ def ack_status(symbol: str):
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
 
 # =====================================================
-# MT5 → RISK SNAPSHOT (ENTRY)
+# MT5 → RISK INGEST (Step 7.3 foundation)
 # =====================================================
 @app.post("/risk")
-def ingest_risk(r: RiskSnapshot):
+def ingest_risk(r: RiskEvent):
     sym = norm_symbol(r.symbol)
-    pos_id = (r.position_id or "").strip()
-
-    if not sym:
+    if not sym or sym == "0":
         raise HTTPException(status_code=400, detail="bad symbol")
-    if not pos_id:
+    posid = (r.position_id or "").strip()
+    if not posid or posid == "0":
         raise HTTPException(status_code=400, detail="bad position_id")
-    if r.risk_usd is None or float(r.risk_usd) <= 0:
-        raise HTTPException(status_code=400, detail="risk_usd must be > 0")
+    if int(r.magic) == 0:
+        raise HTTPException(status_code=400, detail="bad magic")
 
     received = now_utc()
 
@@ -334,38 +306,27 @@ def ingest_risk(r: RiskSnapshot):
         conn = db_conn()
         cur = conn.cursor()
 
-        # Upsert by UNIQUE(position_id)
-        try:
-            cur.execute(
-                """
-                INSERT INTO risks(received_utc,symbol,position_id,magic,open_time,entry_price,sl,lots,risk_usd)
-                VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(position_id) DO UPDATE SET
-                  received_utc=excluded.received_utc,
-                  symbol=excluded.symbol,
-                  magic=excluded.magic,
-                  open_time=excluded.open_time,
-                  entry_price=excluded.entry_price,
-                  sl=excluded.sl,
-                  lots=excluded.lots,
-                  risk_usd=excluded.risk_usd
-                """,
-                (received, sym, pos_id, r.magic, r.open_time, r.entry_price, r.sl, r.lots, float(r.risk_usd))
-            )
-        except Exception:
-            # fallback (older sqlite): replace
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO risks(received_utc,symbol,position_id,magic,open_time,entry_price,sl,lots,risk_usd)
-                VALUES(?,?,?,?,?,?,?,?,?)
-                """,
-                (received, sym, pos_id, r.magic, r.open_time, r.entry_price, r.sl, r.lots, float(r.risk_usd))
-            )
+        # dedup: 1 snapshot per position_id (EA retry safe)
+        row = cur.execute("SELECT id FROM risks WHERE position_id = ? LIMIT 1", (posid,)).fetchone()
+        if row is not None:
+            conn.close()
+            return {"ok": True, "dedup": True, "id": int(row["id"]), "received_utc": received, "symbol": sym, "position_id": posid}
+
+        cur.execute("""
+            INSERT INTO risks(
+                received_utc, account, symbol, position_id, magic,
+                open_time, entry_price, sl, lots, risk_usd, source
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            received, r.account, sym, posid, int(r.magic),
+            r.open_time, r.entry_price, r.sl, r.lots, r.risk_usd, r.source
+        ))
 
         conn.commit()
+        row_id = cur.lastrowid
         conn.close()
 
-    return {"ok": True, "received_utc": received, "symbol": sym, "position_id": pos_id, "risk_usd": float(r.risk_usd)}
+    return {"ok": True, "id": row_id, "received_utc": received, "symbol": sym, "position_id": posid}
 
 @app.get("/risks")
 def list_risks(symbol: Optional[str] = None, limit: int = 200):
@@ -389,19 +350,29 @@ def list_risks(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows), "filters": {"symbol": sym, "limit": limit}}
 
 # =====================================================
-# MT5 → DEAL INGEST (CLOSE) + AUTO-R
+# MT5 → DEAL INGEST (Step 7)
 # =====================================================
-@app.post("/deal")
-def ingest_deal(payload: Union[DealEvent, List[DealEvent]]):
-    # Accept either a single object {...} or a list [{...}]
-    d: DealEvent
-    if isinstance(payload, list):
-        if len(payload) < 1:
-            raise HTTPException(status_code=400, detail="empty deal list")
-        d = payload[0]
-    else:
-        d = payload
+def _net_profit(d: DealEvent) -> float:
+    return float((d.profit or 0.0) + (d.commission or 0.0) + (d.swap or 0.0))
 
+def _fetch_risk_usd_by_position_id(conn: sqlite3.Connection, posid: str) -> Optional[float]:
+    row = conn.execute(
+        "SELECT risk_usd FROM risks WHERE position_id = ? ORDER BY id DESC LIMIT 1",
+        (posid,)
+    ).fetchone()
+    if row is None:
+        return None
+    v = row["risk_usd"]
+    if v is None:
+        return None
+    try:
+        v = float(v)
+    except Exception:
+        return None
+    return v if v > 0 else None
+
+@app.post("/deal")
+def ingest_deal(d: DealEvent):
     sym = norm_symbol(d.symbol)
     typ = norm_action(d.type)
 
@@ -411,46 +382,29 @@ def ingest_deal(payload: Union[DealEvent, List[DealEvent]]):
         raise HTTPException(status_code=400, detail="bad type (BUY/SELL)")
 
     received = now_utc()
-
-    # Map possible aliases
-    account = d.account or d.account_login
-    close_time = d.close_time or d.deal_time
-    close_price = d.close_price if d.close_price is not None else d.price
-
-    deal_id_norm: Optional[str] = None
-    if d.deal_id is not None:
-        deal_id_norm = str(d.deal_id).strip() or None
-
-    pos_id_norm: Optional[str] = None
-    if getattr(d, "position_id", None):
-        pos_id_norm = str(d.position_id).strip() or None
+    posid = (d.position_id or "").strip() or None
 
     with _db_lock:
         conn = db_conn()
         cur = conn.cursor()
 
-        # Dedup if deal_id exists
-        if deal_id_norm is not None:
-            row = cur.execute(
-                "SELECT id FROM deals WHERE deal_id = ? LIMIT 1",
-                (deal_id_norm,)
-            ).fetchone()
+        # Optional: dedup if deal_id exists (avoid duplicates if EA retries)
+        if d.deal_id is not None:
+            row = cur.execute("SELECT id FROM deals WHERE deal_id = ? LIMIT 1", (int(d.deal_id),)).fetchone()
             if row is not None:
                 conn.close()
                 return {"ok": True, "dedup": True, "id": int(row["id"]), "received_utc": received, "symbol": sym}
 
-        # Auto attach risk + compute R
-        risk_usd = d.risk_usd
-        r_mult = d.r_multiple
+        # compute risk_usd/r_multiple if missing and we have position_id
+        net = _net_profit(d)
+        risk = d.risk_usd
+        rmult = d.r_multiple
 
-        if (risk_usd is None or r_mult is None) and pos_id_norm:
-            rr = cur.execute("SELECT risk_usd FROM risks WHERE position_id=? LIMIT 1", (pos_id_norm,)).fetchone()
-            if rr is not None:
-                risk_usd = float(rr["risk_usd"])
+        if (risk is None or float(risk) <= 0.0) and posid:
+            risk = _fetch_risk_usd_by_position_id(conn, posid)
 
-        net_pnl = float((d.profit or 0.0) + (d.commission or 0.0) + (d.swap or 0.0))
-        if r_mult is None and risk_usd is not None and float(risk_usd) > 0:
-            r_mult = net_pnl / float(risk_usd)
+        if rmult is None and (risk is not None) and float(risk) > 0.0:
+            rmult = float(net) / float(risk)
 
         cur.execute("""
             INSERT INTO deals(
@@ -460,17 +414,17 @@ def ingest_deal(payload: Union[DealEvent, List[DealEvent]]):
                 risk_usd, r_multiple
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            received, account, sym, d.magic, d.ticket, deal_id_norm, pos_id_norm, typ, d.lots,
-            d.open_time, close_time, d.open_price, close_price, d.sl, d.tp,
+            received, d.account, sym, d.magic, d.ticket, d.deal_id, posid, typ, d.lots,
+            d.open_time, d.close_time, d.open_price, d.close_price, d.sl, d.tp,
             d.profit, d.commission, d.swap, d.comment,
-            risk_usd, r_mult
+            risk, rmult
         ))
 
         conn.commit()
         row_id = cur.lastrowid
         conn.close()
 
-    return {"ok": True, "id": row_id, "received_utc": received, "symbol": sym, "r_multiple": r_mult}
+    return {"ok": True, "id": row_id, "received_utc": received, "symbol": sym, "position_id": posid, "risk_usd": risk, "r_multiple": rmult}
 
 @app.get("/deals")
 def list_deals(symbol: Optional[str] = None, limit: int = 200):
@@ -494,7 +448,7 @@ def list_deals(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows)}
 
 # =====================================================
-# KPI HELPERS (€)
+# KPI HELPERS (USD PnL, old gates)
 # =====================================================
 def _pnl_row(r: sqlite3.Row) -> float:
     return float((r["profit"] or 0.0) + (r["commission"] or 0.0) + (r["swap"] or 0.0))
@@ -504,7 +458,12 @@ def _fetch_pnls(symbol: str) -> List[float]:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            "SELECT profit, commission, swap FROM deals WHERE symbol = ? ORDER BY id ASC",
+            """
+            SELECT profit, commission, swap
+            FROM deals
+            WHERE symbol = ?
+            ORDER BY id ASC
+            """,
             (sym,)
         ).fetchall()
         conn.close()
@@ -516,7 +475,13 @@ def _fetch_pnls_last_n(symbol: str, n: int) -> List[float]:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            "SELECT profit, commission, swap FROM deals WHERE symbol = ? ORDER BY id DESC LIMIT ?",
+            """
+            SELECT profit, commission, swap
+            FROM deals
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (sym, n)
         ).fetchall()
         conn.close()
@@ -554,6 +519,7 @@ def _max_drawdown(pnls: List[float]) -> float:
     return max_dd
 
 def _today_prefix_mt5() -> str:
+    # close_time stored by EA as "YYYY.MM.DD HH:MM:SS"
     return datetime.now().strftime("%Y.%m.%d")
 
 def _today_pnl(symbol: str) -> float:
@@ -562,14 +528,19 @@ def _today_pnl(symbol: str) -> float:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            "SELECT profit, commission, swap FROM deals WHERE symbol = ? AND close_time LIKE ?",
+            """
+            SELECT profit, commission, swap
+            FROM deals
+            WHERE symbol = ?
+              AND close_time LIKE ?
+            """,
             (sym, f"{pref}%")
         ).fetchall()
         conn.close()
     return float(sum(_pnl_row(r) for r in rows))
 
 # =====================================================
-# KPIs + € Gate
+# KPIs (USD / legacy)
 # =====================================================
 @app.get("/kpis/rolling")
 def kpis_rolling(symbol: str, n: int = 20):
@@ -626,8 +597,10 @@ def status_propfirma(
         reasons.append(f"NetLast{int(n)}<{net_last_n_min}")
     if int(loss_streak) > int(loss_streak_max):
         reasons.append(f"LossStreak>{int(loss_streak_max)}")
+
     if today_net <= -abs(float(daily_dd_limit)):
         reasons.append(f"DailyPnL<={-abs(float(daily_dd_limit))}")
+
     if total_max_dd > abs(float(total_dd_limit)):
         reasons.append(f"TotalMaxDD>{abs(float(total_dd_limit))}")
 
@@ -655,8 +628,35 @@ def status_propfirma(
     }
 
 # =====================================================
-# R helpers + R KPIs + R Gate
+# R-BASED KPIs + R-GATE (Step 8)
 # =====================================================
+def _fetch_rs(symbol: str) -> List[float]:
+    sym = norm_symbol(symbol)
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(
+            """
+            SELECT r_multiple
+            FROM deals
+            WHERE symbol = ?
+              AND r_multiple IS NOT NULL
+            ORDER BY id ASC
+            """,
+            (sym,)
+        ).fetchall()
+        conn.close()
+
+    out: List[float] = []
+    for r in rows:
+        v = r["r_multiple"]
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except Exception:
+            pass
+    return out
+
 def _fetch_rs_last_n(symbol: str, n: int) -> List[float]:
     sym = norm_symbol(symbol)
     n = max(1, min(int(n), 5000))
@@ -674,33 +674,49 @@ def _fetch_rs_last_n(symbol: str, n: int) -> List[float]:
             (sym, n)
         ).fetchall()
         conn.close()
-    rs = [float(r["r_multiple"]) for r in rows if r["r_multiple"] is not None]
+
+    rs: List[float] = []
+    for r in rows:
+        v = r["r_multiple"]
+        if v is None:
+            continue
+        try:
+            rs.append(float(v))
+        except Exception:
+            pass
     rs.reverse()
     return rs
 
-def _max_drawdown_series(xs: List[float]) -> float:
-    peak = float("-inf")
-    eq = 0.0
-    max_dd = 0.0
-    for x in xs:
-        eq += x
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
-    return max_dd
+def _profit_factor_r(rs: List[float]) -> Optional[float]:
+    gp = sum(x for x in rs if x > 0)
+    gl = abs(sum(x for x in rs if x < 0))
+    if gl <= 0:
+        return None
+    return gp / gl
 
-def _loss_streak_count(xs: List[float]) -> int:
+def _loss_streak_r(rs: List[float]) -> int:
     s = 0
-    for x in reversed(xs):
+    for x in reversed(rs):
         if x < 0:
             s += 1
         else:
             break
     return s
 
-@app.get("/kpis/r_rolling")
+def _max_drawdown_r(rs: List[float]) -> float:
+    peak = float("-inf")
+    eq = 0.0
+    max_dd = 0.0
+    for r in rs:
+        eq += r
+        if eq > peak:
+            peak = eq
+        dd = peak - eq
+        if dd > max_dd:
+            max_dd = dd
+    return float(max_dd)
+
+@app.get("/kpis_r/rolling")
 def kpis_r_rolling(symbol: str, n: int = 20):
     sym = norm_symbol(symbol)
     rs = _fetch_rs_last_n(sym, n)
@@ -708,9 +724,11 @@ def kpis_r_rolling(symbol: str, n: int = 20):
     trades = len(rs)
     wins = sum(1 for x in rs if x > 0)
     losses = sum(1 for x in rs if x < 0)
-    net_r = float(sum(rs)) if rs else 0.0
-    dd_r = float(_max_drawdown_series(rs)) if rs else 0.0
-    streak = _loss_streak_count(rs) if rs else 0
+
+    net_r = float(sum(rs))
+    pf_r = _profit_factor_r(rs)
+    streak_r = _loss_streak_r(rs)
+    max_dd_r = _max_drawdown_r(rs)
 
     return {
         "symbol": sym,
@@ -719,49 +737,80 @@ def kpis_r_rolling(symbol: str, n: int = 20):
         "wins": wins,
         "losses": losses,
         "net_r_last_n": round(net_r, 3),
-        "max_drawdown_r_last_n": round(dd_r, 3),
-        "loss_streak": int(streak)
+        "profit_factor_r": (round(pf_r, 3) if pf_r is not None else None),
+        "loss_streak_r": int(streak_r),
+        "max_drawdown_r_last_n": round(max_dd_r, 3),
     }
 
 @app.get("/status/propfirm_r")
 def status_propfirma_r(
     symbol: str,
     n: int = 20,
-    net_r_min: float = -3.0,
-    dd_r_max: float = 4.0,
-    loss_streak_max: int = 3
+
+    pf_r_min: float = 1.20,
+    net_r_last_n_min: float = -3.0,
+    loss_streak_r_max: int = 3,
+
+    max_dd_r_limit: float = 6.0,
+    rolling_dd_r_limit: float = 4.0
 ):
     sym = norm_symbol(symbol)
-    rs = _fetch_rs_last_n(sym, n)
 
-    if len(rs) == 0:
-        return {"symbol": sym, "level": "YELLOW", "reasons": ["No R data yet (need /risk snapshots)"]}
+    rs_last = _fetch_rs_last_n(sym, n)
+    rs_all = _fetch_rs(sym)
 
     reasons: List[str] = []
 
-    net_r = float(sum(rs))
-    dd_r = float(_max_drawdown_series(rs))
-    streak = int(_loss_streak_count(rs))
+    if len(rs_last) < max(5, int(n) // 2):
+        reasons.append("Not enough R data yet")
 
-    if net_r < float(net_r_min): reasons.append(f"NetRLast{int(n)}<{net_r_min}")
-    if dd_r > float(dd_r_max): reasons.append(f"DD_R>{dd_r_max}")
-    if streak > int(loss_streak_max): reasons.append(f"LossStreak>{int(loss_streak_max)}")
+    pf_r = _profit_factor_r(rs_last)
+    net_r_last = float(sum(rs_last))
+    streak_r = _loss_streak_r(rs_last)
+    rolling_dd_r = _max_drawdown_r(rs_last)
+    total_dd_r = _max_drawdown_r(rs_all) if len(rs_all) else 0.0
 
-    level = "RED" if reasons else "GREEN"
+    if pf_r is not None and float(pf_r) < float(pf_r_min):
+        reasons.append(f"PF_R<{pf_r_min}")
+    if net_r_last < float(net_r_last_n_min):
+        reasons.append(f"NetR_Last{int(n)}<{net_r_last_n_min}")
+    if int(streak_r) > int(loss_streak_r_max):
+        reasons.append(f"LossStreakR>{int(loss_streak_r_max)}")
+    if float(rolling_dd_r) > float(rolling_dd_r_limit):
+        reasons.append(f"RollingDD_R>{rolling_dd_r_limit}")
+    if float(total_dd_r) > float(max_dd_r_limit):
+        reasons.append(f"TotalMaxDD_R>{max_dd_r_limit}")
+
+    if reasons:
+        if len(reasons) == 1 and reasons[0] == "Not enough R data yet":
+            level = "YELLOW"
+        else:
+            level = "RED"
+    else:
+        level = "GREEN"
+
     return {
         "symbol": sym,
         "level": level,
         "reasons": reasons,
         "rolling": {
             "n": int(n),
-            "net_r_last_n": round(net_r, 3),
-            "max_drawdown_r_last_n": round(dd_r, 3),
-            "loss_streak": streak
+            "trades_with_r": int(len(rs_last)),
+            "profit_factor_r": (round(pf_r, 3) if pf_r is not None else None),
+            "net_r_last_n": round(net_r_last, 3),
+            "loss_streak_r": int(streak_r),
+            "rolling_dd_r": round(rolling_dd_r, 3),
+        },
+        "total": {
+            "trades_with_r": int(len(rs_all)),
+            "total_max_dd_r": round(total_dd_r, 3),
         },
         "thresholds": {
-            "net_r_min": float(net_r_min),
-            "dd_r_max": float(dd_r_max),
-            "loss_streak_max": int(loss_streak_max)
+            "pf_r_min": float(pf_r_min),
+            "net_r_last_n_min": float(net_r_last_n_min),
+            "loss_streak_r_max": int(loss_streak_r_max),
+            "rolling_dd_r_limit": float(rolling_dd_r_limit),
+            "max_dd_r_limit": float(max_dd_r_limit),
         }
     }
 
@@ -799,5 +848,5 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
         "filters": {"symbol": sym, "limit": limit},
         "last_deals": [dict(r) for r in rows],
         "signals": sigs,
-        "note": "R: POST /risk at entry (position_id); /deal at close auto computes r_multiple via position_id."
+        "note": "Gate is per symbol. /status/propfirm_r?symbol=BTCUSD or XAUUSD"
     }
