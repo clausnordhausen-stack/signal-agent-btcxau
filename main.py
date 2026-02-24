@@ -164,36 +164,21 @@ def db_init() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_symbol_id ON risks(symbol, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_position_id ON risks(position_id)")
 
-        # Safe migrations if older DB exists
-        # Deals add position_id/risk_usd/r_multiple
+        # Safe migrations
         dcols = _table_cols(conn, "deals")
-        for col, coldef in [
-            ("position_id", "TEXT"),
-            ("risk_usd", "REAL"),
-            ("r_multiple", "REAL"),
-        ]:
+        for col, coldef in [("position_id", "TEXT"), ("risk_usd", "REAL"), ("r_multiple", "REAL")]:
             if col not in dcols:
-                try:
-                    cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {coldef}")
-                except Exception:
-                    pass
+                try: cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {coldef}")
+                except Exception: pass
 
-        # Risks add columns if missing
         rcols = _table_cols(conn, "risks")
         for col, coldef in [
-            ("account", "TEXT"),
-            ("magic", "INTEGER"),
-            ("open_time", "TEXT"),
-            ("entry_price", "REAL"),
-            ("sl", "REAL"),
-            ("lots", "REAL"),
-            ("source", "TEXT"),
+            ("account", "TEXT"), ("magic", "INTEGER"), ("open_time", "TEXT"),
+            ("entry_price", "REAL"), ("sl", "REAL"), ("lots", "REAL"), ("source", "TEXT")
         ]:
             if col not in rcols:
-                try:
-                    cur.execute(f"ALTER TABLE risks ADD COLUMN {col} {coldef}")
-                except Exception:
-                    pass
+                try: cur.execute(f"ALTER TABLE risks ADD COLUMN {col} {coldef}")
+                except Exception: pass
 
         conn.commit()
         conn.close()
@@ -203,15 +188,20 @@ def _startup():
     db_init()
 
 # =====================================================
-# ROOT
+# ROOT / HEALTH
 # =====================================================
 @app.get("/")
 def root():
     return {"status": "Signal Agent API is running", "version": "main.py"}
 
-@app.head("/")
-def head_root():
-    return
+@app.get("/health")
+def health():
+    # quick DB check
+    with _db_lock:
+        conn = db_conn()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+    return {"ok": True, "utc": now_utc(), "db_path": DB_PATH, "queue_max": QUEUE_MAX}
 
 # =====================================================
 # TRADINGVIEW → SIGNAL INGEST
@@ -267,7 +257,6 @@ def ack(symbol: str, updated_utc: str):
     updated_utc = updated_utc.strip()
     STATE[sym]["ack"] = updated_utc
 
-    # If ACK matches current latest -> clear latest (single-consumer semantics)
     if STATE[sym].get("updated_utc") == updated_utc:
         STATE[sym]["latest"] = None
         STATE[sym]["updated_utc"] = None
@@ -282,7 +271,7 @@ def ack_status(symbol: str):
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
 
 # =====================================================
-# MT5 → DEAL INGEST
+# DEALS
 # =====================================================
 def _safe_float(x: Any) -> float:
     try:
@@ -309,7 +298,6 @@ def ingest_deal(d: DealEvent):
         conn = db_conn()
         cur = conn.cursor()
 
-        # Dedup by deal_id (safe against retries)
         if d.deal_id is not None:
             row = cur.execute("SELECT id FROM deals WHERE deal_id = ? LIMIT 1", (int(d.deal_id),)).fetchone()
             if row is not None:
@@ -344,10 +332,7 @@ def list_deals(symbol: Optional[str] = None, limit: int = 200):
     with _db_lock:
         conn = db_conn()
         if sym:
-            rows = conn.execute(
-                "SELECT * FROM deals WHERE symbol = ? ORDER BY id DESC LIMIT ?",
-                (sym, limit)
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM deals WHERE symbol = ? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM deals ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         conn.close()
@@ -355,7 +340,7 @@ def list_deals(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows)}
 
 # =====================================================
-# MT5 → RISK INGEST
+# RISKS
 # =====================================================
 @app.post("/risk")
 def ingest_risk(r: RiskEvent):
@@ -369,8 +354,6 @@ def ingest_risk(r: RiskEvent):
 
     received = now_utc()
     posid = str(r.position_id).strip()
-
-    # Dedup: if same position_id already exists, keep newest? We dedup by position_id+source
     src = (r.source or "mt5-risk-snapshot").strip()
 
     with _db_lock:
@@ -415,7 +398,7 @@ def list_risks(symbol: Optional[str] = None, limit: int = 200):
     return {"items": [dict(r) for r in rows], "count": len(rows)}
 
 # =====================================================
-# JOIN CHECK (Debug): position_id coverage
+# JOIN CHECK (Debug)
 # =====================================================
 @app.get("/join_check")
 def join_check(symbol: str, limit: int = 50):
@@ -424,21 +407,14 @@ def join_check(symbol: str, limit: int = 50):
 
     with _db_lock:
         conn = db_conn()
-        risk_rows = conn.execute(
-            "SELECT position_id FROM risks WHERE symbol=? ORDER BY id DESC LIMIT ?",
-            (sym, limit)
-        ).fetchall()
-        deal_rows = conn.execute(
-            "SELECT position_id FROM deals WHERE symbol=? ORDER BY id DESC LIMIT ?",
-            (sym, limit)
-        ).fetchall()
-
-        risks = [str(r["position_id"]) for r in risk_rows if r["position_id"]]
-        deals = [str(r["position_id"]) for r in deal_rows if r["position_id"]]
+        risk_rows = conn.execute("SELECT position_id FROM risks WHERE symbol=? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
+        deal_rows = conn.execute("SELECT position_id FROM deals WHERE symbol=? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
         conn.close()
 
-    set_r = set(risks)
-    set_d = set(deals)
+    risks = [str(r["position_id"]) for r in risk_rows if r["position_id"]]
+    deals = [str(r["position_id"]) for r in deal_rows if r["position_id"]]
+    set_r, set_d = set(risks), set(deals)
+
     matching = sorted(list(set_r.intersection(set_d)))
     only_r = sorted(list(set_r - set_d))
     only_d = sorted(list(set_d - set_r))
@@ -460,14 +436,13 @@ def join_check(symbol: str, limit: int = 50):
         "only_in_deals_sample": only_d[:10],
         "tips": [
             "matching_posids should grow after EA entries + deal closes.",
-            "If deals have position_id but risks are empty -> /risk not sent yet (no EA entries).",
-            "If risks have posid but deals missing -> deal sender not sending position_id or close deals not yet occurred.",
-            "If both exist but do not match -> you're using different identifiers (POSITION_IDENTIFIER vs DEAL_POSITION_ID mismatch)."
+            "If deals have position_id but risks are empty -> /risk not sent yet.",
+            "If both exist but do not match -> identifiers mismatch (POSITION_IDENTIFIER vs DEAL_POSITION_ID)."
         ]
     }
 
 # =====================================================
-# RE-CALC R: fill deals.risk_usd + deals.r_multiple using risks table
+# RE-CALC R (Deal←Risk join)
 # =====================================================
 @app.get("/recalc_r")
 def recalc_r(symbol: str, limit: int = 5000):
@@ -481,7 +456,6 @@ def recalc_r(symbol: str, limit: int = 5000):
         conn = db_conn()
         cur = conn.cursor()
 
-        # Take last N deals with position_id
         deals = cur.execute(
             """
             SELECT id, position_id, profit, commission, swap, risk_usd, r_multiple
@@ -495,13 +469,11 @@ def recalc_r(symbol: str, limit: int = 5000):
 
         for d in deals:
             scanned += 1
-            deal_id_row = int(d["id"])
+            deal_row_id = int(d["id"])
             posid = str(d["position_id"])
-            net = float(_safe_float(d["profit"]) + _safe_float(d["commission"]) + _safe_float(d["swap"]))
 
-            # Skip if already has r_multiple
-            has_r = d["r_multiple"] is not None and str(d["r_multiple"]) != ""
-            has_risk = d["risk_usd"] is not None and str(d["risk_usd"]) != ""
+            has_r = d["r_multiple"] is not None
+            has_risk = d["risk_usd"] is not None
             if has_r and has_risk:
                 continue
 
@@ -516,17 +488,14 @@ def recalc_r(symbol: str, limit: int = 5000):
             if risk_usd <= 0:
                 continue
 
+            net = float(_safe_float(d["profit"]) + _safe_float(d["commission"]) + _safe_float(d["swap"]))
             r_mult = net / risk_usd
 
-            cur.execute(
-                "UPDATE deals SET risk_usd=?, r_multiple=? WHERE id=?",
-                (risk_usd, r_mult, deal_id_row)
-            )
+            cur.execute("UPDATE deals SET risk_usd=?, r_multiple=? WHERE id=?", (risk_usd, r_mult, deal_row_id))
             updated += 1
 
         conn.commit()
 
-        # For response: preview join
         preview = cur.execute(
             """
             SELECT d.id AS deal_row_id, d.deal_id, d.position_id AS deal_position_id,
@@ -544,13 +513,7 @@ def recalc_r(symbol: str, limit: int = 5000):
 
         conn.close()
 
-    return {
-        "ok": True,
-        "symbol": sym,
-        "scanned": scanned,
-        "updated": updated,
-        "join_preview": [dict(r) for r in preview],
-    }
+    return {"ok": True, "symbol": sym, "scanned": scanned, "updated": updated, "join_preview": [dict(r) for r in preview]}
 
 # =====================================================
 # KPI HELPERS
@@ -585,7 +548,6 @@ def _max_drawdown(values: List[float]) -> float:
     return max_dd
 
 def _today_prefix_mt5() -> str:
-    # close_time stored by EA as "YYYY.MM.DD HH:MM:SS"
     return datetime.now().strftime("%Y.%m.%d")
 
 def _today_pnl(symbol: str) -> float:
@@ -594,12 +556,7 @@ def _today_pnl(symbol: str) -> float:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            """
-            SELECT profit, commission, swap
-            FROM deals
-            WHERE symbol = ?
-              AND close_time LIKE ?
-            """,
+            "SELECT profit, commission, swap FROM deals WHERE symbol=? AND close_time LIKE ?",
             (sym, f"{pref}%")
         ).fetchall()
         conn.close()
@@ -611,13 +568,7 @@ def _fetch_netpnls_last_n(symbol: str, n: int) -> List[float]:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            """
-            SELECT profit, commission, swap
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
+            "SELECT profit, commission, swap FROM deals WHERE symbol=? ORDER BY id DESC LIMIT ?",
             (sym, n)
         ).fetchall()
         conn.close()
@@ -629,10 +580,7 @@ def _fetch_netpnls_all(symbol: str) -> List[float]:
     sym = norm_symbol(symbol)
     with _db_lock:
         conn = db_conn()
-        rows = conn.execute(
-            "SELECT profit, commission, swap FROM deals WHERE symbol=? ORDER BY id ASC",
-            (sym,)
-        ).fetchall()
+        rows = conn.execute("SELECT profit, commission, swap FROM deals WHERE symbol=? ORDER BY id ASC", (sym,)).fetchall()
         conn.close()
     return [float(_net_profit_row(r)) for r in rows]
 
@@ -642,14 +590,7 @@ def _fetch_rmultiples_last_n(symbol: str, n: int) -> List[float]:
     with _db_lock:
         conn = db_conn()
         rows = conn.execute(
-            """
-            SELECT r_multiple
-            FROM deals
-            WHERE symbol = ?
-              AND r_multiple IS NOT NULL
-            ORDER BY id DESC
-            LIMIT ?
-            """,
+            "SELECT r_multiple FROM deals WHERE symbol=? AND r_multiple IS NOT NULL ORDER BY id DESC LIMIT ?",
             (sym, n)
         ).fetchall()
         conn.close()
@@ -671,176 +612,67 @@ def _fetch_rmultiples_all(symbol: str) -> List[float]:
 # =====================================================
 # USD KPIs + USD GATE
 # =====================================================
-@app.get("/kpis/rolling")
-def kpis_rolling(symbol: str, n: int = 20):
-    sym = norm_symbol(symbol)
-    pnls = _fetch_netpnls_last_n(sym, n)
-
-    trades = len(pnls)
-    wins = sum(1 for x in pnls if x > 0)
-    losses = sum(1 for x in pnls if x < 0)
-    net = float(sum(pnls))
-    pf = _profit_factor(pnls)
-    streak = _loss_streak(pnls)
-    max_dd = _max_drawdown(pnls)
-
-    return {
-        "symbol": sym,
-        "n": int(n),
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "net_last_n": round(net, 2),
-        "profit_factor": (round(pf, 3) if pf is not None else None),
-        "loss_streak": int(streak),
-        "max_drawdown_last_n": round(max_dd, 2),
-    }
-
 @app.get("/status/propfirm")
 def status_propfirma(
     symbol: str,
-    # Rolling window
     n: int = 20,
     min_trades: int = 3,
-    # Thresholds
     pf_min: float = 1.30,
     net_last_n_min: float = -200.0,
     loss_streak_max: int = 3,
-    # DD limits (per symbol; based on captured deals)
-    daily_dd_limit: float = 350.0,   # today pnl must be > -350
-    total_dd_limit: float = 600.0    # max drawdown must be <= 600
+    daily_dd_limit: float = 350.0,
+    total_dd_limit: float = 600.0
 ):
     sym = norm_symbol(symbol)
-
     pnls_last = _fetch_netpnls_last_n(sym, n)
     trades = len(pnls_last)
 
     if trades < int(min_trades):
         return {
-            "symbol": sym,
-            "level": "YELLOW",
+            "symbol": sym, "level": "YELLOW",
             "reasons": [f"NotEnoughDeals<{min_trades}"],
-            "rolling": {"n": int(n), "trades": trades},
-            "thresholds": {
-                "min_trades": int(min_trades),
-                "pf_min": float(pf_min),
-                "net_last_n_min": float(net_last_n_min),
-                "loss_streak_max": int(loss_streak_max),
-                "daily_dd_limit": -abs(float(daily_dd_limit)),
-                "total_dd_limit": abs(float(total_dd_limit)),
-            }
+            "rolling": {"n": int(n), "trades": trades}
         }
 
     pf = _profit_factor(pnls_last)
     net_last_n = float(sum(pnls_last))
     loss_streak = _loss_streak(pnls_last)
-
     today_net = _today_pnl(sym)
-
-    pnls_all = _fetch_netpnls_all(sym)
-    total_max_dd = _max_drawdown(pnls_all)
+    total_max_dd = _max_drawdown(_fetch_netpnls_all(sym))
 
     reasons: List[str] = []
-
-    if pf is not None and float(pf) < float(pf_min):
-        reasons.append(f"PF<{pf_min}")
-    if net_last_n < float(net_last_n_min):
-        reasons.append(f"NetLast{int(n)}<{net_last_n_min}")
-    if int(loss_streak) > int(loss_streak_max):
-        reasons.append(f"LossStreak>{int(loss_streak_max)}")
-
-    if today_net <= -abs(float(daily_dd_limit)):
-        reasons.append(f"DailyPnL<={-abs(float(daily_dd_limit))}")
-
-    if total_max_dd > abs(float(total_dd_limit)):
-        reasons.append(f"TotalMaxDD>{abs(float(total_dd_limit))}")
+    if pf is not None and float(pf) < float(pf_min): reasons.append(f"PF<{pf_min}")
+    if net_last_n < float(net_last_n_min): reasons.append(f"NetLast{int(n)}<{net_last_n_min}")
+    if int(loss_streak) > int(loss_streak_max): reasons.append(f"LossStreak>{int(loss_streak_max)}")
+    if today_net <= -abs(float(daily_dd_limit)): reasons.append(f"DailyPnL<={-abs(float(daily_dd_limit))}")
+    if total_max_dd > abs(float(total_dd_limit)): reasons.append(f"TotalMaxDD>{abs(float(total_dd_limit))}")
 
     level = "RED" if reasons else "GREEN"
-
-    return {
-        "symbol": sym,
-        "level": level,
-        "reasons": reasons,
-        "rolling": {
-            "n": int(n),
-            "trades": trades,
-            "profit_factor": (round(pf, 3) if pf is not None else None),
-            "net_last_n": round(net_last_n, 2),
-            "loss_streak": int(loss_streak),
-            "max_drawdown_last_n": round(_max_drawdown(pnls_last), 2),
-        },
-        "today": {"day": _today_prefix_mt5(), "net_profit": round(today_net, 2)},
-        "total": {"max_drawdown": round(total_max_dd, 2)},
-        "thresholds": {
-            "min_trades": int(min_trades),
-            "pf_min": float(pf_min),
-            "net_last_n_min": float(net_last_n_min),
-            "loss_streak_max": int(loss_streak_max),
-            "daily_dd_limit": -abs(float(daily_dd_limit)),
-            "total_dd_limit": abs(float(total_dd_limit)),
-        }
-    }
+    return {"symbol": sym, "level": level, "reasons": reasons}
 
 # =====================================================
 # R KPIs + R GATE
 # =====================================================
-@app.get("/kpis_r/rolling")
-def kpis_r_rolling(symbol: str, n: int = 20):
-    sym = norm_symbol(symbol)
-    rs = _fetch_rmultiples_last_n(sym, n)
-
-    trades = len(rs)
-    wins = sum(1 for x in rs if x > 0)
-    losses = sum(1 for x in rs if x < 0)
-    net_r = float(sum(rs))
-    pf_r = _profit_factor(rs)
-    streak_r = _loss_streak(rs)
-    max_dd_r = _max_drawdown(rs)
-
-    return {
-        "symbol": sym,
-        "n": int(n),
-        "trades": trades,
-        "wins": wins,
-        "losses": losses,
-        "net_r_last_n": round(net_r, 4),
-        "pf_r": (round(pf_r, 4) if pf_r is not None else None),
-        "loss_streak_r": int(streak_r),
-        "max_dd_r_last_n": round(max_dd_r, 4),
-    }
-
 @app.get("/status/propfirm_r")
 def status_propfirma_r(
     symbol: str,
     n: int = 20,
     min_trades_r: int = 3,
-    # Thresholds in R-units
     pf_r_min: float = 1.20,
     net_r_last_n_min: float = -3.0,
     loss_streak_r_max: int = 3,
-    # Drawdown in R
     max_dd_r_limit: float = 6.0,
     rolling_dd_r_limit: float = 4.0
 ):
     sym = norm_symbol(symbol)
-
     rs_last = _fetch_rmultiples_last_n(sym, n)
     trades = len(rs_last)
 
     if trades < int(min_trades_r):
         return {
-            "symbol": sym,
-            "level": "YELLOW",
+            "symbol": sym, "level": "YELLOW",
             "reasons": [f"NotEnoughR<{min_trades_r}"],
-            "rolling": {"n": int(n), "trades": trades},
-            "thresholds": {
-                "min_trades_r": int(min_trades_r),
-                "pf_r_min": float(pf_r_min),
-                "net_r_last_n_min": float(net_r_last_n_min),
-                "loss_streak_r_max": int(loss_streak_r_max),
-                "rolling_dd_r_limit": float(rolling_dd_r_limit),
-                "max_dd_r_limit": float(max_dd_r_limit),
-            }
+            "rolling": {"n": int(n), "trades": trades}
         }
 
     pf_r = _profit_factor(rs_last)
@@ -852,77 +684,32 @@ def status_propfirma_r(
     max_dd_r_all = _max_drawdown(rs_all) if rs_all else 0.0
 
     reasons: List[str] = []
-
-    if pf_r is not None and float(pf_r) < float(pf_r_min):
-        reasons.append(f"PF_R<{pf_r_min}")
-    if net_r_last_n < float(net_r_last_n_min):
-        reasons.append(f"NetRLast{int(n)}<{net_r_last_n_min}")
-    if int(streak_r) > int(loss_streak_r_max):
-        reasons.append(f"LossStreakR>{int(loss_streak_r_max)}")
-
-    if float(rolling_dd_r) > float(rolling_dd_r_limit):
-        reasons.append(f"RollingDD_R>{rolling_dd_r_limit}")
-
-    if float(max_dd_r_all) > float(max_dd_r_limit):
-        reasons.append(f"MaxDD_R>{max_dd_r_limit}")
+    if pf_r is not None and float(pf_r) < float(pf_r_min): reasons.append(f"PF_R<{pf_r_min}")
+    if net_r_last_n < float(net_r_last_n_min): reasons.append(f"NetRLast{int(n)}<{net_r_last_n_min}")
+    if int(streak_r) > int(loss_streak_r_max): reasons.append(f"LossStreakR>{int(loss_streak_r_max)}")
+    if float(rolling_dd_r) > float(rolling_dd_r_limit): reasons.append(f"RollingDD_R>{rolling_dd_r_limit}")
+    if float(max_dd_r_all) > float(max_dd_r_limit): reasons.append(f"MaxDD_R>{max_dd_r_limit}")
 
     level = "RED" if reasons else "GREEN"
-
     return {
-        "symbol": sym,
-        "level": level,
-        "reasons": reasons,
+        "symbol": sym, "level": level, "reasons": reasons,
         "rolling": {
-            "n": int(n),
-            "trades": trades,
+            "n": int(n), "trades": trades,
             "pf_r": (round(pf_r, 4) if pf_r is not None else None),
             "net_r_last_n": round(net_r_last_n, 4),
             "loss_streak_r": int(streak_r),
             "rolling_dd_r": round(rolling_dd_r, 4),
         },
-        "total": {"max_dd_r": round(max_dd_r_all, 4)},
-        "thresholds": {
-            "min_trades_r": int(min_trades_r),
-            "pf_r_min": float(pf_r_min),
-            "net_r_last_n_min": float(net_r_last_n_min),
-            "loss_streak_r_max": int(loss_streak_r_max),
-            "rolling_dd_r_limit": float(rolling_dd_r_limit),
-            "max_dd_r_limit": float(max_dd_r_limit),
-        }
+        "total": {"max_dd_r": round(max_dd_r_all, 4)}
     }
 
 # =====================================================
-# COMBO GATE (Option B): RED if any RED, GREEN if both GREEN, else YELLOW
+# COMBO GATE (USD+R) per SYMBOL
 # =====================================================
 @app.get("/status/gate_combo")
-def status_gate_combo(
-    symbol: str,
-    n: int = 20,
-    # USD gate
-    min_trades: int = 3,
-    pf_min: float = 1.30,
-    net_last_n_min: float = -200.0,
-    loss_streak_max: int = 3,
-    daily_dd_limit: float = 350.0,
-    total_dd_limit: float = 600.0,
-    # R gate
-    min_trades_r: int = 3,
-    pf_r_min: float = 1.20,
-    net_r_last_n_min: float = -3.0,
-    loss_streak_r_max: int = 3,
-    max_dd_r_limit: float = 6.0,
-    rolling_dd_r_limit: float = 4.0
-):
-    usd = status_propfirma(
-        symbol=symbol, n=n, min_trades=min_trades,
-        pf_min=pf_min, net_last_n_min=net_last_n_min, loss_streak_max=loss_streak_max,
-        daily_dd_limit=daily_dd_limit, total_dd_limit=total_dd_limit
-    )
-    r = status_propfirma_r(
-        symbol=symbol, n=n, min_trades_r=min_trades_r,
-        pf_r_min=pf_r_min, net_r_last_n_min=net_r_last_n_min, loss_streak_r_max=loss_streak_r_max,
-        max_dd_r_limit=max_dd_r_limit, rolling_dd_r_limit=rolling_dd_r_limit
-    )
+def status_gate_combo(symbol: str, n: int = 20):
+    usd = status_propfirma(symbol=symbol, n=n)
+    r = status_propfirma_r(symbol=symbol, n=n)
 
     usd_level = (usd.get("level") or "YELLOW").upper()
     r_level = (r.get("level") or "YELLOW").upper()
@@ -941,11 +728,168 @@ def status_gate_combo(
         "r_level": r_level,
         "usd": usd,
         "r": r,
-        "note": "Combo logic (B): RED if any RED, GREEN if both GREEN, else YELLOW."
+        "note": "Combo: RED if any RED, GREEN if both GREEN, else YELLOW."
     }
 
 # =====================================================
-# SUMMARY
+# STEP 9: PORTFOLIO R-GATE (multi-symbol)
+# =====================================================
+def _parse_syms_csv(s: str) -> List[str]:
+    parts = [norm_symbol(x) for x in (s or "").split(",")]
+    return [p for p in parts if p]
+
+def _portfolio_merge_levels(levels: List[str]) -> str:
+    L = [(x or "YELLOW").upper() for x in levels]
+    if any(x == "RED" for x in L): return "RED"
+    if all(x == "GREEN" for x in L) and len(L) > 0: return "GREEN"
+    return "YELLOW"
+
+@app.get("/status/portfolio_r")
+def status_portfolio_r(
+    symbols: str = "BTCUSD,XAUUSD",
+    n: int = 20,
+    min_trades_r: int = 3,
+    pf_r_min: float = 1.20,
+    net_r_last_n_min: float = -3.0,
+    loss_streak_r_max: int = 3,
+    max_dd_r_limit: float = 6.0,
+    rolling_dd_r_limit: float = 4.0
+):
+    syms = _parse_syms_csv(symbols)
+    if not syms:
+        raise HTTPException(status_code=400, detail="bad symbols")
+
+    per: Dict[str, Any] = {}
+    levels: List[str] = []
+
+    # aggregate reasons: union
+    all_reasons: List[str] = []
+
+    for s in syms:
+        r = status_propfirma_r(
+            symbol=s, n=n,
+            min_trades_r=min_trades_r,
+            pf_r_min=pf_r_min,
+            net_r_last_n_min=net_r_last_n_min,
+            loss_streak_r_max=loss_streak_r_max,
+            max_dd_r_limit=max_dd_r_limit,
+            rolling_dd_r_limit=rolling_dd_r_limit
+        )
+        per[s] = r
+        lvl = (r.get("level") or "YELLOW").upper()
+        levels.append(lvl)
+        for rr in (r.get("reasons") or []):
+            if rr not in all_reasons:
+                all_reasons.append(rr)
+
+    portfolio_level = _portfolio_merge_levels(levels)
+
+    return {
+        "portfolio_level": portfolio_level,
+        "symbols": syms,
+        "levels": {syms[i]: levels[i] for i in range(len(syms))},
+        "reasons": all_reasons,
+        "per_symbol": per,
+        "note": "Portfolio R-gate: RED if any symbol RED, GREEN only if all GREEN, else YELLOW."
+    }
+
+@app.get("/status/portfolio_combo")
+def status_portfolio_combo(symbols: str = "BTCUSD,XAUUSD", n: int = 20):
+    syms = _parse_syms_csv(symbols)
+    if not syms:
+        raise HTTPException(status_code=400, detail="bad symbols")
+
+    per: Dict[str, Any] = {}
+    levels: List[str] = []
+    all_reasons: List[str] = []
+
+    for s in syms:
+        c = status_gate_combo(symbol=s, n=n)
+        per[s] = c
+        lvl = (c.get("combo_level") or "YELLOW").upper()
+        levels.append(lvl)
+
+        # reasons from both inner blocks
+        usd_reasons = (c.get("usd", {}).get("reasons") or [])
+        r_reasons = (c.get("r", {}).get("reasons") or [])
+        for rr in usd_reasons + r_reasons:
+            if rr not in all_reasons:
+                all_reasons.append(rr)
+
+    portfolio_level = _portfolio_merge_levels(levels)
+    return {
+        "portfolio_level": portfolio_level,
+        "symbols": syms,
+        "levels": {syms[i]: levels[i] for i in range(len(syms))},
+        "reasons": all_reasons,
+        "per_symbol": per,
+        "note": "Portfolio combo: RED if any symbol RED, GREEN only if all GREEN, else YELLOW."
+    }
+
+# =====================================================
+# STEP 9: DASHBOARD (read-only monitoring)
+# =====================================================
+def _last_rows(table: str, symbol: Optional[str], limit: int) -> List[dict]:
+    limit = max(1, min(int(limit), 200))
+    sym = norm_symbol(symbol) if symbol else None
+    with _db_lock:
+        conn = db_conn()
+        if sym:
+            rows = conn.execute(f"SELECT * FROM {table} WHERE symbol=? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
+        else:
+            rows = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+    return [dict(r) for r in rows]
+
+@app.get("/dashboard")
+def dashboard(
+    symbols: str = "BTCUSD,XAUUSD",
+    limit_deals: int = 10,
+    limit_risks: int = 10,
+    n_gate: int = 20
+):
+    syms = _parse_syms_csv(symbols)
+
+    # signals snapshot
+    sigs: Dict[str, Any] = {}
+    for s in syms:
+        if s in STATE:
+            sigs[s] = {
+                "latest": STATE[s].get("latest"),
+                "updated_utc": STATE[s].get("updated_utc"),
+                "ack": STATE[s].get("ack")
+            }
+        else:
+            sigs[s] = {"latest": None, "updated_utc": None, "ack": None}
+
+    # per-symbol gates + last rows
+    per: Dict[str, Any] = {}
+    for s in syms:
+        per[s] = {
+            "gate_combo": status_gate_combo(symbol=s, n=n_gate),
+            "gate_r": status_propfirma_r(symbol=s, n=n_gate),
+            "last_deals": _last_rows("deals", s, limit_deals),
+            "last_risks": _last_rows("risks", s, limit_risks),
+            "join_check": join_check(symbol=s, limit=50)
+        }
+
+    port_r = status_portfolio_r(symbols=",".join(syms), n=n_gate)
+    port_combo = status_portfolio_combo(symbols=",".join(syms), n=n_gate)
+
+    return {
+        "utc": now_utc(),
+        "symbols": syms,
+        "signals": sigs,
+        "portfolio": {
+            "r": port_r,
+            "combo": port_combo
+        },
+        "per_symbol": per,
+        "note": "Read-only dashboard. Use it in browser for monitoring."
+    }
+
+# =====================================================
+# SUMMARY (legacy)
 # =====================================================
 @app.get("/summary")
 def summary(symbol: Optional[str] = None, limit: int = 20):
@@ -955,7 +899,7 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
     with _db_lock:
         conn = db_conn()
         if sym:
-            rows = conn.execute("SELECT * FROM deals WHERE symbol = ? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
+            rows = conn.execute("SELECT * FROM deals WHERE symbol=? ORDER BY id DESC LIMIT ?", (sym, limit)).fetchall()
         else:
             rows = conn.execute("SELECT * FROM deals ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         conn.close()
@@ -968,9 +912,4 @@ def summary(symbol: Optional[str] = None, limit: int = 20):
         for s in list(STATE.keys())[:50]:
             sigs[s] = {"latest": STATE[s].get("latest"), "updated_utc": STATE[s].get("updated_utc"), "ack": STATE[s].get("ack")}
 
-    return {
-        "filters": {"symbol": sym, "limit": limit},
-        "last_deals": [dict(r) for r in rows],
-        "signals": sigs,
-        "note": "Use /status/gate_combo?symbol=BTCUSD (Dual Gate USD+R)."
-    }
+    return {"filters": {"symbol": sym, "limit": limit}, "last_deals": [dict(r) for r in rows], "signals": sigs}
