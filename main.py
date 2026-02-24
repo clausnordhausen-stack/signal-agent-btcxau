@@ -1,23 +1,41 @@
-from fastapi import FastAPI, HTTPException
+# main.py
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from collections import deque
 import sqlite3
 import os
+import json
+import hashlib
 from threading import Lock
+from uuid import uuid4
 
-app = FastAPI(title="Signal Agent API")
+app = FastAPI(title="Signal Agent API", version="v2-controls")
 
 # =====================================================
 # CONFIG
 # =====================================================
-SECRET = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
+SECRET = os.getenv("SECRET_KEY", "claus-2026-xau-01!")          # TradingView webhook key (unchanged)
 QUEUE_MAX = int(os.getenv("QUEUE_MAX", "50"))
 
 # Persist on Render by mounting a Disk and setting: DB_PATH=/var/data/data.db
 DB_PATH = os.getenv("DB_PATH", "data.db")
 _db_lock = Lock()
+
+# --- v1 Auth (simple, but future-proof) ---
+# EA_KEYS: comma-separated list of EA bearer tokens (e.g. "ea123,ea456")
+EA_KEYS_ENV = os.getenv("EA_KEYS", "").strip()
+EA_KEYS = [k.strip() for k in EA_KEYS_ENV.split(",") if k.strip()]
+
+# APP_TOKEN: single bearer token for your phone app (e.g. "app123")
+APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
+
+# Controls: defaults
+DEFAULT_MODE = "ON"
+DEFAULT_RISK_FACTOR = 1.0
+DEFAULT_ALLOW_NEW_ENTRIES = True
+
 
 # =====================================================
 # MODELS
@@ -71,6 +89,31 @@ class RiskEvent(BaseModel):
     risk_usd: float
     source: Optional[str] = "mt5-risk-snapshot"
 
+# --- Controls v1 models ---
+ScopeType = Literal["GLOBAL", "SYMBOL"]
+ModeType = Literal["ON", "REDUCED", "PAUSED"]
+
+class HeartbeatEvent(BaseModel):
+    device_id: Optional[str] = None
+    label: Optional[str] = None
+    symbol: str
+    magic: Optional[int] = None
+    ea_version: Optional[str] = None
+    ts: Optional[str] = None  # optional client ts
+
+class ControlsPatch(BaseModel):
+    mode: Optional[ModeType] = None
+    risk_factor: Optional[float] = None
+    allow_new_entries: Optional[bool] = None
+
+class ControlsSetRequest(BaseModel):
+    scope_type: ScopeType
+    scope_id: Optional[str] = ""         # "" for GLOBAL, "BTCUSD" for SYMBOL
+    patch: ControlsPatch
+    reason: Optional[str] = None
+    updated_by: Optional[str] = "app"    # optional label
+
+
 # =====================================================
 # STATE (Signals in-memory)
 # =====================================================
@@ -93,6 +136,38 @@ def ensure_sym(sym: str) -> None:
             "queue": deque(maxlen=QUEUE_MAX),
             "ack": None
         }
+
+# =====================================================
+# AUTH HELPERS
+# =====================================================
+def _bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        return ""
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2:
+        return ""
+    scheme, token = parts[0].strip(), parts[1].strip()
+    if scheme.lower() != "bearer":
+        return ""
+    return token
+
+def require_app(authorization: Optional[str]) -> None:
+    tok = _bearer_token(authorization)
+    if not APP_TOKEN:
+        raise HTTPException(status_code=500, detail="APP_TOKEN not set on server")
+    if tok != APP_TOKEN:
+        raise HTTPException(status_code=401, detail="unauthorized (app)")
+
+def require_ea(authorization: Optional[str]) -> None:
+    tok = _bearer_token(authorization)
+    if not EA_KEYS:
+        raise HTTPException(status_code=500, detail="EA_KEYS not set on server")
+    if tok not in EA_KEYS:
+        raise HTTPException(status_code=401, detail="unauthorized (ea)")
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()
+
 
 # =====================================================
 # DATABASE
@@ -157,19 +232,68 @@ def db_init() -> None:
         )
         """)
 
+        # --- Devices (heartbeat) ---
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            label TEXT,
+            symbol TEXT NOT NULL,
+            magic INTEGER,
+            ea_version TEXT,
+            ea_key_hash TEXT,
+            last_seen_utc TEXT,
+            status TEXT
+        )
+        """)
+
+        # --- Controls (GLOBAL + SYMBOL) ---
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS controls (
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            risk_factor REAL NOT NULL,
+            allow_new_entries INTEGER NOT NULL,
+            updated_utc TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            updated_by TEXT,
+            reason TEXT,
+            PRIMARY KEY (scope_type, scope_id)
+        )
+        """)
+
+        # --- Control events (audit) ---
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS control_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_type TEXT NOT NULL,
+            scope_id TEXT NOT NULL,
+            old_json TEXT,
+            new_json TEXT,
+            updated_utc TEXT NOT NULL,
+            updated_by TEXT,
+            reason TEXT
+        )
+        """)
+
         # Indexes
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_symbol_id ON deals(symbol, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_deal_id ON deals(deal_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_deals_position_id ON deals(position_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_symbol_id ON risks(symbol, id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_risks_position_id ON risks(position_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_devices_symbol_seen ON devices(symbol, last_seen_utc)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_controls_version ON controls(version)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_control_events_scope ON control_events(scope_type, scope_id, id)")
 
-        # Safe migrations
+        # Safe migrations (legacy safety)
         dcols = _table_cols(conn, "deals")
         for col, coldef in [("position_id", "TEXT"), ("risk_usd", "REAL"), ("r_multiple", "REAL")]:
             if col not in dcols:
-                try: cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {coldef}")
-                except Exception: pass
+                try:
+                    cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {coldef}")
+                except Exception:
+                    pass
 
         rcols = _table_cols(conn, "risks")
         for col, coldef in [
@@ -177,8 +301,30 @@ def db_init() -> None:
             ("entry_price", "REAL"), ("sl", "REAL"), ("lots", "REAL"), ("source", "TEXT")
         ]:
             if col not in rcols:
-                try: cur.execute(f"ALTER TABLE risks ADD COLUMN {col} {coldef}")
-                except Exception: pass
+                try:
+                    cur.execute(f"ALTER TABLE risks ADD COLUMN {col} {coldef}")
+                except Exception:
+                    pass
+
+        # Initialize default controls if missing
+        def _ensure_control(scope_type: str, scope_id: str):
+            row = cur.execute(
+                "SELECT scope_type, scope_id FROM controls WHERE scope_type=? AND scope_id=? LIMIT 1",
+                (scope_type, scope_id)
+            ).fetchone()
+            if row is None:
+                cur.execute(
+                    "INSERT INTO controls(scope_type, scope_id, mode, risk_factor, allow_new_entries, updated_utc, version, updated_by, reason) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (
+                        scope_type, scope_id,
+                        DEFAULT_MODE, float(DEFAULT_RISK_FACTOR), int(DEFAULT_ALLOW_NEW_ENTRIES),
+                        now_utc(), 1, "system", "init default"
+                    )
+                )
+
+        _ensure_control("GLOBAL", "")
+        # Note: SYMBOL rows created on-demand when app sets them.
 
         conn.commit()
         conn.close()
@@ -192,16 +338,24 @@ def _startup():
 # =====================================================
 @app.get("/")
 def root():
-    return {"status": "Signal Agent API is running", "version": "main.py"}
+    return {"status": "Signal Agent API is running", "version": "main.py", "controls": "v1-global+symbol"}
 
 @app.get("/health")
 def health():
-    # quick DB check
     with _db_lock:
         conn = db_conn()
         conn.execute("SELECT 1").fetchone()
         conn.close()
-    return {"ok": True, "utc": now_utc(), "db_path": DB_PATH, "queue_max": QUEUE_MAX}
+    return {
+        "ok": True,
+        "utc": now_utc(),
+        "db_path": DB_PATH,
+        "queue_max": QUEUE_MAX,
+        "auth": {
+            "ea_keys_configured": bool(EA_KEYS),
+            "app_token_configured": bool(APP_TOKEN),
+        }
+    }
 
 # =====================================================
 # TRADINGVIEW → SIGNAL INGEST
@@ -269,6 +423,309 @@ def ack_status(symbol: str):
     if sym not in STATE:
         return {"symbol": sym, "ack": None}
     return {"symbol": sym, "ack": STATE[sym].get("ack")}
+
+# =====================================================
+# DEVICES / HEARTBEAT (EA)
+# =====================================================
+@app.post("/hb")
+def heartbeat(hb: HeartbeatEvent, authorization: Optional[str] = Header(default=None)):
+    require_ea(authorization)
+
+    sym = norm_symbol(hb.symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="bad symbol")
+
+    device_id = (hb.device_id or "").strip()
+    if not device_id:
+        device_id = str(uuid4())
+
+    label = (hb.label or "").strip()
+    ea_version = (hb.ea_version or "").strip()
+    received = now_utc()
+    key_hash = _sha256(_bearer_token(authorization))
+
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        row = cur.execute("SELECT device_id FROM devices WHERE device_id=? LIMIT 1", (device_id,)).fetchone()
+        if row is None:
+            cur.execute(
+                """
+                INSERT INTO devices(device_id, label, symbol, magic, ea_version, ea_key_hash, last_seen_utc, status)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (device_id, label, sym, hb.magic, ea_version, key_hash, received, "ONLINE")
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE devices
+                SET label=?, symbol=?, magic=?, ea_version=?, ea_key_hash=?, last_seen_utc=?, status=?
+                WHERE device_id=?
+                """,
+                (label, sym, hb.magic, ea_version, key_hash, received, "ONLINE", device_id)
+            )
+
+        conn.commit()
+        conn.close()
+
+    return {"ok": True, "server_utc": received, "device_id": device_id, "status": "ONLINE"}
+
+@app.get("/devices")
+def list_devices(limit: int = 200, authorization: Optional[str] = Header(default=None)):
+    require_app(authorization)
+    limit = max(1, min(int(limit), 2000))
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute("SELECT * FROM devices ORDER BY last_seen_utc DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
+
+# =====================================================
+# CONTROLS (GLOBAL + SYMBOL)
+# =====================================================
+def _get_control_row(cur: sqlite3.Cursor, scope_type: str, scope_id: str) -> Optional[sqlite3.Row]:
+    return cur.execute(
+        "SELECT * FROM controls WHERE scope_type=? AND scope_id=? LIMIT 1",
+        (scope_type, scope_id)
+    ).fetchone()
+
+def _next_version(cur: sqlite3.Cursor) -> int:
+    row = cur.execute("SELECT MAX(version) AS mv FROM controls").fetchone()
+    mv = int(row["mv"] or 0)
+    return mv + 1
+
+def _normalize_scope(scope_type: str, scope_id: str) -> (str, str):
+    st = (scope_type or "").strip().upper()
+    sid = (scope_id or "").strip()
+    if st not in ("GLOBAL", "SYMBOL"):
+        raise HTTPException(status_code=400, detail="bad scope_type")
+    if st == "GLOBAL":
+        return "GLOBAL", ""
+    # SYMBOL
+    sym = norm_symbol(sid)
+    if not sym:
+        raise HTTPException(status_code=400, detail="bad scope_id for SYMBOL")
+    return "SYMBOL", sym
+
+def _clamp_risk_factor(x: float) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return DEFAULT_RISK_FACTOR
+    # keep it sane:
+    if v < 0.05:
+        v = 0.05
+    if v > 1.0:
+        v = 1.0
+    return v
+
+def _effective_controls(symbol: str, cur: sqlite3.Cursor) -> Dict[str, Any]:
+    sym = norm_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="bad symbol")
+
+    # Ensure GLOBAL exists
+    g = _get_control_row(cur, "GLOBAL", "")
+    if g is None:
+        # should not happen if db_init ran, but safe:
+        cur.execute(
+            "INSERT INTO controls(scope_type, scope_id, mode, risk_factor, allow_new_entries, updated_utc, version, updated_by, reason) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            ("GLOBAL", "", DEFAULT_MODE, float(DEFAULT_RISK_FACTOR), int(DEFAULT_ALLOW_NEW_ENTRIES), now_utc(), 1, "system", "init default")
+        )
+        g = _get_control_row(cur, "GLOBAL", "")
+
+    s = _get_control_row(cur, "SYMBOL", sym)  # may be None
+
+    # base from GLOBAL
+    mode = (g["mode"] or DEFAULT_MODE).upper()
+    rf = float(g["risk_factor"] or DEFAULT_RISK_FACTOR)
+    ane = bool(int(g["allow_new_entries"] or 0))
+
+    sources = {
+        "global": {"version": int(g["version"]), "updated_utc": g["updated_utc"]},
+        "symbol": None
+    }
+
+    effective_version = int(g["version"])
+
+    if s is not None:
+        sources["symbol"] = {"version": int(s["version"]), "updated_utc": s["updated_utc"]}
+        effective_version = max(effective_version, int(s["version"]))
+
+        s_mode = (s["mode"] or mode).upper()
+        s_rf = float(s["risk_factor"] or rf)
+        s_ane = bool(int(s["allow_new_entries"] or 0))
+
+        # Merge rules:
+        # - PAUSED beats all
+        # - allow_new_entries false beats all
+        # - risk_factor = min
+        if s_mode == "PAUSED" or mode == "PAUSED":
+            mode = "PAUSED"
+        else:
+            # if symbol is set to PAUSED it already handled; otherwise symbol can override ON/REDUCED
+            if s_mode in ("ON", "REDUCED"):
+                mode = s_mode
+
+        ane = (ane and s_ane)  # any false => false
+        rf = min(rf, s_rf)
+
+    # normalize rf and ane
+    rf = _clamp_risk_factor(rf)
+
+    return {
+        "symbol": sym,
+        "effective": {
+            "mode": mode if mode in ("ON", "REDUCED", "PAUSED") else DEFAULT_MODE,
+            "risk_factor": float(rf),
+            "allow_new_entries": bool(ane),
+        },
+        "sources": sources,
+        "effective_version": int(effective_version),
+    }
+
+@app.get("/controls/effective")
+def controls_effective(
+    symbol: str,
+    since_version: int = 0,
+    authorization: Optional[str] = Header(default=None)
+):
+    # EA reads effective controls
+    require_ea(authorization)
+
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        eff = _effective_controls(symbol, cur)
+        conn.close()
+
+    ev = int(eff["effective_version"])
+    if int(since_version) >= ev:
+        return {"unchanged": True, "effective_version": ev}
+
+    return eff
+
+@app.get("/controls/get")
+def controls_get(
+    scope_type: ScopeType,
+    scope_id: str = "",
+    authorization: Optional[str] = Header(default=None)
+):
+    # App reads raw control row
+    require_app(authorization)
+    st, sid = _normalize_scope(scope_type, scope_id)
+
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        row = _get_control_row(cur, st, sid)
+        conn.close()
+
+    if row is None:
+        # if SYMBOL missing, return implied defaults (do not auto-create)
+        if st == "SYMBOL":
+            return {
+                "scope_type": "SYMBOL",
+                "scope_id": norm_symbol(sid),
+                "exists": False,
+                "implied": {
+                    "mode": None,
+                    "risk_factor": None,
+                    "allow_new_entries": None
+                }
+            }
+        raise HTTPException(status_code=404, detail="control not found")
+
+    return {"exists": True, "item": dict(row)}
+
+@app.post("/controls/set")
+def controls_set(req: ControlsSetRequest, authorization: Optional[str] = Header(default=None)):
+    # App sets controls (GLOBAL or SYMBOL)
+    require_app(authorization)
+    st, sid = _normalize_scope(req.scope_type, req.scope_id or "")
+
+    patch = req.patch
+    if patch.mode is None and patch.risk_factor is None and patch.allow_new_entries is None:
+        raise HTTPException(status_code=400, detail="empty patch")
+
+    reason = (req.reason or "").strip()[:250]
+    updated_by = (req.updated_by or "app").strip()[:80]
+    updated_utc = now_utc()
+
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+
+        old = _get_control_row(cur, st, sid)
+        old_json = json.dumps(dict(old), ensure_ascii=False) if old is not None else None
+
+        # base from old or defaults
+        mode = (old["mode"] if old is not None else DEFAULT_MODE)
+        rf = float(old["risk_factor"] if old is not None else DEFAULT_RISK_FACTOR)
+        ane = bool(int(old["allow_new_entries"] if old is not None else int(DEFAULT_ALLOW_NEW_ENTRIES)))
+
+        if patch.mode is not None:
+            mode = patch.mode
+        if patch.risk_factor is not None:
+            rf = _clamp_risk_factor(float(patch.risk_factor))
+        if patch.allow_new_entries is not None:
+            ane = bool(patch.allow_new_entries)
+
+        # version bump (monotonic across table)
+        new_ver = _next_version(cur)
+
+        if old is None:
+            cur.execute(
+                """
+                INSERT INTO controls(scope_type, scope_id, mode, risk_factor, allow_new_entries, updated_utc, version, updated_by, reason)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (st, sid, mode, float(rf), int(ane), updated_utc, new_ver, updated_by, reason)
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE controls
+                SET mode=?, risk_factor=?, allow_new_entries=?, updated_utc=?, version=?, updated_by=?, reason=?
+                WHERE scope_type=? AND scope_id=?
+                """,
+                (mode, float(rf), int(ane), updated_utc, new_ver, updated_by, reason, st, sid)
+            )
+
+        new_row = _get_control_row(cur, st, sid)
+        new_json = json.dumps(dict(new_row), ensure_ascii=False) if new_row is not None else None
+
+        cur.execute(
+            """
+            INSERT INTO control_events(scope_type, scope_id, old_json, new_json, updated_utc, updated_by, reason)
+            VALUES(?,?,?,?,?,?,?)
+            """,
+            (st, sid, old_json, new_json, updated_utc, updated_by, reason)
+        )
+
+        conn.commit()
+        conn.close()
+
+    return {"ok": True, "scope_type": st, "scope_id": sid, "new_version": int(new_ver), "updated_utc": updated_utc}
+
+@app.get("/control_events")
+def control_events(scope_type: ScopeType, scope_id: str = "", limit: int = 100, authorization: Optional[str] = Header(default=None)):
+    require_app(authorization)
+    st, sid = _normalize_scope(scope_type, scope_id or "")
+    limit = max(1, min(int(limit), 2000))
+
+    with _db_lock:
+        conn = db_conn()
+        rows = conn.execute(
+            "SELECT * FROM control_events WHERE scope_type=? AND scope_id=? ORDER BY id DESC LIMIT ?",
+            (st, sid, limit)
+        ).fetchall()
+        conn.close()
+
+    return {"items": [dict(r) for r in rows], "count": len(rows)}
 
 # =====================================================
 # DEALS
@@ -732,102 +1189,7 @@ def status_gate_combo(symbol: str, n: int = 20):
     }
 
 # =====================================================
-# STEP 9: PORTFOLIO R-GATE (multi-symbol)
-# =====================================================
-def _parse_syms_csv(s: str) -> List[str]:
-    parts = [norm_symbol(x) for x in (s or "").split(",")]
-    return [p for p in parts if p]
-
-def _portfolio_merge_levels(levels: List[str]) -> str:
-    L = [(x or "YELLOW").upper() for x in levels]
-    if any(x == "RED" for x in L): return "RED"
-    if all(x == "GREEN" for x in L) and len(L) > 0: return "GREEN"
-    return "YELLOW"
-
-@app.get("/status/portfolio_r")
-def status_portfolio_r(
-    symbols: str = "BTCUSD,XAUUSD",
-    n: int = 20,
-    min_trades_r: int = 3,
-    pf_r_min: float = 1.20,
-    net_r_last_n_min: float = -3.0,
-    loss_streak_r_max: int = 3,
-    max_dd_r_limit: float = 6.0,
-    rolling_dd_r_limit: float = 4.0
-):
-    syms = _parse_syms_csv(symbols)
-    if not syms:
-        raise HTTPException(status_code=400, detail="bad symbols")
-
-    per: Dict[str, Any] = {}
-    levels: List[str] = []
-
-    # aggregate reasons: union
-    all_reasons: List[str] = []
-
-    for s in syms:
-        r = status_propfirma_r(
-            symbol=s, n=n,
-            min_trades_r=min_trades_r,
-            pf_r_min=pf_r_min,
-            net_r_last_n_min=net_r_last_n_min,
-            loss_streak_r_max=loss_streak_r_max,
-            max_dd_r_limit=max_dd_r_limit,
-            rolling_dd_r_limit=rolling_dd_r_limit
-        )
-        per[s] = r
-        lvl = (r.get("level") or "YELLOW").upper()
-        levels.append(lvl)
-        for rr in (r.get("reasons") or []):
-            if rr not in all_reasons:
-                all_reasons.append(rr)
-
-    portfolio_level = _portfolio_merge_levels(levels)
-
-    return {
-        "portfolio_level": portfolio_level,
-        "symbols": syms,
-        "levels": {syms[i]: levels[i] for i in range(len(syms))},
-        "reasons": all_reasons,
-        "per_symbol": per,
-        "note": "Portfolio R-gate: RED if any symbol RED, GREEN only if all GREEN, else YELLOW."
-    }
-
-@app.get("/status/portfolio_combo")
-def status_portfolio_combo(symbols: str = "BTCUSD,XAUUSD", n: int = 20):
-    syms = _parse_syms_csv(symbols)
-    if not syms:
-        raise HTTPException(status_code=400, detail="bad symbols")
-
-    per: Dict[str, Any] = {}
-    levels: List[str] = []
-    all_reasons: List[str] = []
-
-    for s in syms:
-        c = status_gate_combo(symbol=s, n=n)
-        per[s] = c
-        lvl = (c.get("combo_level") or "YELLOW").upper()
-        levels.append(lvl)
-
-        # reasons from both inner blocks
-        usd_reasons = (c.get("usd", {}).get("reasons") or [])
-        r_reasons = (c.get("r", {}).get("reasons") or [])
-        for rr in usd_reasons + r_reasons:
-            if rr not in all_reasons:
-                all_reasons.append(rr)
-
-    portfolio_level = _portfolio_merge_levels(levels)
-    return {
-        "portfolio_level": portfolio_level,
-        "symbols": syms,
-        "levels": {syms[i]: levels[i] for i in range(len(syms))},
-        "reasons": all_reasons,
-        "per_symbol": per,
-        "note": "Portfolio combo: RED if any symbol RED, GREEN only if all GREEN, else YELLOW."
-    }
-
-# =====================================================
-# STEP 9: DASHBOARD (read-only monitoring)
+# DASHBOARD (read-only monitoring)
 # =====================================================
 def _last_rows(table: str, symbol: Optional[str], limit: int) -> List[dict]:
     limit = max(1, min(int(limit), 200))
@@ -841,13 +1203,22 @@ def _last_rows(table: str, symbol: Optional[str], limit: int) -> List[dict]:
         conn.close()
     return [dict(r) for r in rows]
 
+def _parse_syms_csv(s: str) -> List[str]:
+    parts = [norm_symbol(x) for x in (s or "").split(",")]
+    return [p for p in parts if p]
+
 @app.get("/dashboard")
 def dashboard(
     symbols: str = "BTCUSD,XAUUSD",
     limit_deals: int = 10,
     limit_risks: int = 10,
-    n_gate: int = 20
+    n_gate: int = 20,
+    authorization: Optional[str] = Header(default=None)
 ):
+    # For v1 you can leave dashboard public or protect it.
+    # If you want to protect it now, uncomment next line:
+    # require_app(authorization)
+
     syms = _parse_syms_csv(symbols)
 
     # signals snapshot
@@ -862,30 +1233,28 @@ def dashboard(
         else:
             sigs[s] = {"latest": None, "updated_utc": None, "ack": None}
 
-    # per-symbol gates + last rows
+    # per-symbol gates + last rows + effective controls
     per: Dict[str, Any] = {}
-    for s in syms:
-        per[s] = {
-            "gate_combo": status_gate_combo(symbol=s, n=n_gate),
-            "gate_r": status_propfirma_r(symbol=s, n=n_gate),
-            "last_deals": _last_rows("deals", s, limit_deals),
-            "last_risks": _last_rows("risks", s, limit_risks),
-            "join_check": join_check(symbol=s, limit=50)
-        }
-
-    port_r = status_portfolio_r(symbols=",".join(syms), n=n_gate)
-    port_combo = status_portfolio_combo(symbols=",".join(syms), n=n_gate)
+    with _db_lock:
+        conn = db_conn()
+        cur = conn.cursor()
+        for s in syms:
+            per[s] = {
+                "gate_combo": status_gate_combo(symbol=s, n=n_gate),
+                "gate_r": status_propfirma_r(symbol=s, n=n_gate),
+                "last_deals": _last_rows("deals", s, limit_deals),
+                "last_risks": _last_rows("risks", s, limit_risks),
+                "join_check": join_check(symbol=s, limit=50),
+                "controls_effective": _effective_controls(s, cur),
+            }
+        conn.close()
 
     return {
         "utc": now_utc(),
         "symbols": syms,
         "signals": sigs,
-        "portfolio": {
-            "r": port_r,
-            "combo": port_combo
-        },
         "per_symbol": per,
-        "note": "Read-only dashboard. Use it in browser for monitoring."
+        "note": "Read-only dashboard."
     }
 
 # =====================================================
