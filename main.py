@@ -1,12 +1,14 @@
 # app.py
-# FastAPI Signal Agent API (Copy/Paste) - FIXED (Idempotent /tv)
-# - Per-Account ACK (so 5 MT5 terminals can all execute the same signal)
-# - /latest supports ?account= &magic= to return "unacked for this account"
-# - SQLite persistence (Render-safe if you mount a disk)
+# FastAPI Signal Agent API (Copy/Paste) - FIXED "1 trade per signal"
+# Key points:
+# - /tv is tolerant (symbol|ticker, action|side, buy/sell/long/short)
+# - IMPORTANT FIX: if sender does NOT provide ts/id, we do NOT create new updated_utc
+#   when the action is the same as the last stored signal for that symbol.
+#   => repeated webhooks won't create "new" signals => EA won't open repeated trades.
 #
 # Endpoints:
 #   GET  /                       -> health
-#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant + de-dup)
+#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant, stable updated_utc)
 #   GET  /latest?symbol=...&account=...&magic=...
 #   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
 #   GET  /status/gate_combo?symbol=...
@@ -18,7 +20,6 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
-import hashlib
 from datetime import datetime, timezone
 from typing import Optional, Literal, Any, Dict
 
@@ -28,7 +29,6 @@ from pydantic import BaseModel
 # --------------------------- CONFIG ---------------------------
 
 APP_NAME = "Signal Agent API (Per-Account ACK)"
-
 SECRET = os.getenv("SECRET", "claus-2026-xau-01!")
 DB_PATH = os.getenv("DB_PATH", "agent.db")
 
@@ -59,9 +59,6 @@ def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
-
-def sha1_hex(b: bytes) -> str:
-    return hashlib.sha1(b).hexdigest()
 
 # --------------------------- DB INIT ---------------------------
 
@@ -125,17 +122,6 @@ def db_init() -> None:
         """
     )
 
-    # NEW: idempotency table (prevents repeated trades on webhook retries/duplicates)
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS tv_events (
-            event_key TEXT PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            created_utc TEXT NOT NULL
-        )
-        """
-    )
-
     con.commit()
     con.close()
 
@@ -170,35 +156,21 @@ def _startup() -> None:
 
 @app.get("/")
 def root() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "utc": now_utc_iso(),
-        "db_path": DB_PATH,
-    }
+    return {"status": "ok", "service": APP_NAME, "utc": now_utc_iso(), "db_path": DB_PATH}
 
-# --------------------------- SIGNAL INGEST (TOLERANT + IDEMPOTENT) ---------------------------
+# --------------------------- SIGNAL INGEST (FIXED) ---------------------------
 
 @app.post("/tv")
 async def tv(req: Request) -> Dict[str, Any]:
     """
-    Tolerant TradingView ingest:
-    - key in body OR ?key=
-    - symbol OR ticker
-    - action OR side (buy/sell/long/short, any case)
-    - ts optional, id optional
-
-    IDEMPOTENCY:
-    - We derive event_key = id OR ts OR sha1(raw_body)
-    - If the same event_key arrives again, we do NOT update signals(updated_utc),
-      so EAs won't see a "new" signal and won't open repeated trades.
+    FIXED behavior for "1 trade per signal":
+    - If sender provides ts or id -> we treat it as a real new signal (updated_utc = ts or now)
+    - If sender does NOT provide ts AND does NOT provide id:
+        - and last stored signal for symbol has SAME action -> we KEEP old updated_utc (no "new" signal!)
+        - if action changed -> we generate a new updated_utc once.
     """
-    raw = await req.body()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Body must not be empty")
-
     try:
-        body = json.loads(raw.decode("utf-8"))
+        body = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Body must be valid JSON")
 
@@ -219,33 +191,38 @@ async def tv(req: Request) -> Dict[str, Any]:
     ts = str(body.get("ts") or "").strip()
     tv_id = str(body.get("id") or "").strip()
 
-    # Stable event key: prefer explicit id, then ts, else body-hash (TV retries are usually identical body)
-    event_key = f"{sym}|{tv_id}" if tv_id else (f"{sym}|{ts}" if ts else f"{sym}|sha1:{sha1_hex(raw)}")
-
     con = db_connect()
     cur = con.cursor()
 
-    # Try to insert event_key; if it already exists -> duplicate -> do nothing
-    try:
-        cur.execute(
-            "INSERT INTO tv_events(event_key, symbol, created_utc) VALUES(?,?,?)",
-            (event_key, sym, now_utc_iso()),
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        con.close()
-        return {"ok": True, "duplicate": True, "symbol": sym, "action": act, "event_key": event_key}
+    # read current stored signal (if any)
+    row = cur.execute("SELECT updated_utc, action, payload_json FROM signals WHERE symbol=?", (sym,)).fetchone()
+    prev_upd = str(row["updated_utc"]) if row else ""
+    prev_act = str(row["action"]) if row else ""
 
-    # IMPORTANT: updated_utc must be stable per event (use ts if present, else generate once here)
-    updated_utc = ts or now_utc_iso()
+    # Decide updated_utc (critical)
+    if ts or tv_id:
+        # real new signal indicated by sender
+        updated_utc = ts or now_utc_iso()
+    else:
+        # no ts/id => treat repeated same-direction as duplicate: DO NOT refresh updated_utc
+        if prev_act == act and prev_upd:
+            updated_utc = prev_upd
+        else:
+            # direction changed OR first ever => create one new updated_utc
+            updated_utc = now_utc_iso()
 
     payload = {
         "symbol": sym,
         "action": act,
         "updated_utc": updated_utc,
         "id": tv_id,
-        "event_key": event_key,
+        "ts": ts,
     }
+
+    # If nothing effectively changed (same action & same updated_utc), just respond OK (idempotent)
+    if prev_act == act and prev_upd == updated_utc:
+        con.close()
+        return {"ok": True, "duplicate": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
 
     cur.execute(
         """
@@ -262,15 +239,15 @@ async def tv(req: Request) -> Dict[str, Any]:
     con.commit()
     con.close()
 
-    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act, "event_key": event_key}
+    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
 
 # --------------------------- LATEST (Per-Account) ---------------------------
 
 @app.get("/latest")
 def latest(
-    symbol: str = Query(..., description="e.g. BTCUSD, XAUUSD"),
-    account: Optional[str] = Query(None, description="MT5 login; enables per-account ACK logic"),
-    magic: Optional[str] = Query(None, description="EA magic; used for ACK keying (recommended)"),
+    symbol: str = Query(...),
+    account: Optional[str] = Query(None),
+    magic: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     sym = norm_symbol(symbol)
     con = db_connect()
@@ -351,13 +328,7 @@ def gate_combo(symbol: str = Query(...)) -> Dict[str, Any]:
     con.close()
 
     if not row:
-        return {
-            "symbol": sym,
-            "combo_level": "GREEN",
-            "usd_level": "UNKNOWN",
-            "r_level": "UNKNOWN",
-            "updated_utc": "",
-        }
+        return {"symbol": sym, "combo_level": "GREEN", "usd_level": "UNKNOWN", "r_level": "UNKNOWN", "updated_utc": ""}
 
     return {
         "symbol": sym,
