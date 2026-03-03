@@ -1,21 +1,17 @@
 # app.py
-# FastAPI Signal Agent API (Copy/Paste)
+# FastAPI Signal Agent API (Copy/Paste) - FIXED
 # - Per-Account ACK (so 5 MT5 terminals can all execute the same signal)
 # - /latest supports ?account= &magic= to return "unacked for this account"
 # - SQLite persistence (Render-safe if you mount a disk)
 #
 # Endpoints:
 #   GET  /                       -> health
-#   POST /tv                     -> ingest TradingView signal (key-protected)
+#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant payload)
 #   GET  /latest?symbol=...&account=...&magic=...
 #   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
 #   GET  /status/gate_combo?symbol=...
 #   POST /status/gate_combo      -> update gate levels (key-protected)
 #   POST /risk                   -> store initial risk snapshot (optional)
-#
-# Notes:
-# - For true multi-account mirroring: update your EA PollLatest() URL to include &account=ACCOUNT_LOGIN&magic=InpMagic
-# - Your EA already sends account/magic in /ack in my RR1to1 version. This backend supports it.
 
 from __future__ import annotations
 
@@ -25,8 +21,8 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, Literal, Any, Dict
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel
 
 # --------------------------- CONFIG ---------------------------
 
@@ -49,6 +45,18 @@ def norm_symbol(s: str) -> str:
 
 def norm_action(a: str) -> str:
     return (a or "").strip().upper()
+
+def coerce_action(a: str) -> str:
+    """
+    Accept common TradingView variants:
+      buy/sell, BUY/SELL, long/short
+    """
+    x = norm_action(a)
+    if x in ("BUY", "LONG"):
+        return "BUY"
+    if x in ("SELL", "SHORT"):
+        return "SELL"
+    return ""
 
 def require_key(key: str) -> None:
     if not key or key != SECRET:
@@ -124,15 +132,6 @@ def db_init() -> None:
 
 # --------------------------- MODELS ---------------------------
 
-class TVSignal(BaseModel):
-    key: str
-    symbol: str
-    action: Literal["BUY", "SELL"]
-    # Optional timestamp from TV; if missing we generate updated_utc ourselves
-    ts: Optional[str] = None
-    # Optional id from TV
-    id: Optional[str] = None
-
 class GateUpdate(BaseModel):
     key: str
     symbol: str
@@ -169,26 +168,52 @@ def root() -> Dict[str, Any]:
         "db_path": DB_PATH,
     }
 
-# --------------------------- SIGNAL INGEST ---------------------------
+# --------------------------- SIGNAL INGEST (TOLERANT) ---------------------------
 
 @app.post("/tv")
-def tv(signal: TVSignal) -> Dict[str, Any]:
-    require_key(signal.key)
+async def tv(req: Request) -> Dict[str, Any]:
+    """
+    Tolerant TradingView ingest:
+    Accepts JSON bodies with any of:
+      - key in body OR ?key= query
+      - symbol OR ticker
+      - action OR side (buy/sell/long/short, any case)
+      - ts optional
+      - id optional
+    This avoids FastAPI/Pydantic 422 for lowercase buy/sell or different field names.
+    """
+    # Parse JSON (if invalid JSON, FastAPI will usually throw 422/400; we return a clean 400)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON")
 
-    sym = norm_symbol(signal.symbol)
-    act = norm_action(signal.action)
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON must be an object")
+
+    # key: allow in JSON or query string
+    key = str(body.get("key") or req.query_params.get("key") or "").strip()
+    require_key(key)
+
+    # symbol: accept symbol or ticker
+    sym = norm_symbol(str(body.get("symbol") or body.get("ticker") or ""))
+    if not sym:
+        raise HTTPException(status_code=400, detail="Missing symbol (use 'symbol' or 'ticker')")
+
+    # action: accept action or side
+    raw_action = str(body.get("action") or body.get("side") or "")
+    act = coerce_action(raw_action)
     if act not in ("BUY", "SELL"):
-        raise HTTPException(status_code=400, detail="action must be BUY or SELL")
+        raise HTTPException(status_code=400, detail="Invalid action (use BUY/SELL or buy/sell/long/short)")
 
-    updated_utc = (signal.ts or "").strip()
-    if not updated_utc:
-        updated_utc = now_utc_iso()
+    updated_utc = str(body.get("ts") or "").strip() or now_utc_iso()
+    tv_id = str(body.get("id") or "")
 
     payload = {
         "symbol": sym,
         "action": act,
         "updated_utc": updated_utc,
-        "id": (signal.id or ""),
+        "id": tv_id,
     }
 
     con = db_connect()
@@ -230,23 +255,19 @@ def latest(
     payload = json.loads(row["payload_json"])
     upd = str(row["updated_utc"])
 
-    # Backward compatible:
-    # - If account not given, always return latest (old behavior).
+    # Backward compatible: if account not given, always return latest (old behavior).
     if not account:
         con.close()
         return {"symbol": sym, "updated_utc": upd, "signal": payload}
 
     acc = str(account).strip()
-    mag = str(magic or "").strip()
-    if not mag:
-        mag = "0"
+    mag = str(magic or "").strip() or "0"
 
     ack = cur.execute(
         "SELECT updated_utc FROM acks WHERE symbol=? AND account=? AND magic=?",
         (sym, acc, mag),
     ).fetchone()
 
-    # If this account already acked THIS updated_utc -> return no signal
     if ack and str(ack["updated_utc"]) == upd:
         con.close()
         return {"symbol": sym, "updated_utc": upd, "signal": None, "acked": True}
@@ -267,6 +288,7 @@ def ack(
     acc = str(account).strip()
     mag = str(magic).strip() if magic is not None else "0"
     upd = (updated_utc or "").strip()
+
     if not upd:
         raise HTTPException(status_code=400, detail="updated_utc required")
     if not acc:
@@ -301,7 +323,6 @@ def gate_combo(symbol: str = Query(...)) -> Dict[str, Any]:
     con.close()
 
     if not row:
-        # default if never set
         return {
             "symbol": sym,
             "combo_level": "GREEN",
@@ -346,7 +367,6 @@ def gate_combo_update(g: GateUpdate) -> Dict[str, Any]:
 
 @app.post("/risk")
 def risk(snapshot: RiskSnapshot) -> Dict[str, Any]:
-    # optional: if you want to protect, add require_key and include key in model
     con = db_connect()
     cur = con.cursor()
     cur.execute(
