@@ -163,11 +163,10 @@ def root() -> Dict[str, Any]:
 @app.post("/tv")
 async def tv(req: Request) -> Dict[str, Any]:
     """
-    FIXED behavior for "1 trade per signal":
-    - If sender provides ts or id -> we treat it as a real new signal (updated_utc = ts or now)
-    - If sender does NOT provide ts AND does NOT provide id:
-        - and last stored signal for symbol has SAME action -> we KEEP old updated_utc (no "new" signal!)
-        - if action changed -> we generate a new updated_utc once.
+    HARD SAFE MODE (NO ts/id):
+    - We IGNORE ts and id completely (even if sender provides them).
+    - A "new" signal is created ONLY when action changes vs last stored for this symbol.
+    - Repeated same-direction webhooks keep the old updated_utc => EA won't re-trade.
     """
     try:
         body = await req.json()
@@ -188,39 +187,30 @@ async def tv(req: Request) -> Dict[str, Any]:
     if act not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="Invalid action (use BUY/SELL or buy/sell/long/short)")
 
-    ts = str(body.get("ts") or "").strip()
-    tv_id = str(body.get("id") or "").strip()
-
     con = db_connect()
     cur = con.cursor()
 
     # read current stored signal (if any)
-    row = cur.execute("SELECT updated_utc, action, payload_json FROM signals WHERE symbol=?", (sym,)).fetchone()
+    row = cur.execute("SELECT updated_utc, action FROM signals WHERE symbol=?", (sym,)).fetchone()
     prev_upd = str(row["updated_utc"]) if row else ""
     prev_act = str(row["action"]) if row else ""
 
-    # Decide updated_utc (critical)
-    if ts or tv_id:
-        # real new signal indicated by sender
-        updated_utc = ts or now_utc_iso()
+    # ONLY change updated_utc when direction changes OR first ever
+    if prev_act == act and prev_upd:
+        updated_utc = prev_upd
+        duplicate = True
     else:
-        # no ts/id => treat repeated same-direction as duplicate: DO NOT refresh updated_utc
-        if prev_act == act and prev_upd:
-            updated_utc = prev_upd
-        else:
-            # direction changed OR first ever => create one new updated_utc
-            updated_utc = now_utc_iso()
+        updated_utc = now_utc_iso()
+        duplicate = False
 
     payload = {
         "symbol": sym,
         "action": act,
         "updated_utc": updated_utc,
-        "id": tv_id,
-        "ts": ts,
+        # NOTE: intentionally not storing sender ts/id
     }
 
-    # If nothing effectively changed (same action & same updated_utc), just respond OK (idempotent)
-    if prev_act == act and prev_upd == updated_utc:
+    if duplicate:
         con.close()
         return {"ok": True, "duplicate": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
 
