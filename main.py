@@ -1,12 +1,12 @@
 # app.py
-# FastAPI Signal Agent API (Copy/Paste) - FIXED
+# FastAPI Signal Agent API (Copy/Paste) - FIXED (Idempotent /tv)
 # - Per-Account ACK (so 5 MT5 terminals can all execute the same signal)
 # - /latest supports ?account= &magic= to return "unacked for this account"
 # - SQLite persistence (Render-safe if you mount a disk)
 #
 # Endpoints:
 #   GET  /                       -> health
-#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant payload)
+#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant + de-dup)
 #   GET  /latest?symbol=...&account=...&magic=...
 #   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
 #   GET  /status/gate_combo?symbol=...
@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import json
 import sqlite3
+import hashlib
 from datetime import datetime, timezone
 from typing import Optional, Literal, Any, Dict
 
@@ -28,11 +29,7 @@ from pydantic import BaseModel
 
 APP_NAME = "Signal Agent API (Per-Account ACK)"
 
-# Use env SECRET if set; fallback for local dev
 SECRET = os.getenv("SECRET", "claus-2026-xau-01!")
-
-# IMPORTANT on Render:
-# - If you mount a persistent disk, set DB_PATH to that mount path, e.g. /var/data/agent.db
 DB_PATH = os.getenv("DB_PATH", "agent.db")
 
 # --------------------------- UTILS ---------------------------
@@ -47,10 +44,6 @@ def norm_action(a: str) -> str:
     return (a or "").strip().upper()
 
 def coerce_action(a: str) -> str:
-    """
-    Accept common TradingView variants:
-      buy/sell, BUY/SELL, long/short
-    """
     x = norm_action(a)
     if x in ("BUY", "LONG"):
         return "BUY"
@@ -66,6 +59,11 @@ def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
+
+def sha1_hex(b: bytes) -> str:
+    return hashlib.sha1(b).hexdigest()
+
+# --------------------------- DB INIT ---------------------------
 
 def db_init() -> None:
     con = db_connect()
@@ -127,6 +125,17 @@ def db_init() -> None:
         """
     )
 
+    # NEW: idempotency table (prevents repeated trades on webhook retries/duplicates)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tv_events (
+            event_key TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            created_utc TEXT NOT NULL
+        )
+        """
+    )
+
     con.commit()
     con.close()
 
@@ -168,56 +177,76 @@ def root() -> Dict[str, Any]:
         "db_path": DB_PATH,
     }
 
-# --------------------------- SIGNAL INGEST (TOLERANT) ---------------------------
+# --------------------------- SIGNAL INGEST (TOLERANT + IDEMPOTENT) ---------------------------
 
 @app.post("/tv")
 async def tv(req: Request) -> Dict[str, Any]:
     """
     Tolerant TradingView ingest:
-    Accepts JSON bodies with any of:
-      - key in body OR ?key= query
-      - symbol OR ticker
-      - action OR side (buy/sell/long/short, any case)
-      - ts optional
-      - id optional
-    This avoids FastAPI/Pydantic 422 for lowercase buy/sell or different field names.
+    - key in body OR ?key=
+    - symbol OR ticker
+    - action OR side (buy/sell/long/short, any case)
+    - ts optional, id optional
+
+    IDEMPOTENCY:
+    - We derive event_key = id OR ts OR sha1(raw_body)
+    - If the same event_key arrives again, we do NOT update signals(updated_utc),
+      so EAs won't see a "new" signal and won't open repeated trades.
     """
-    # Parse JSON (if invalid JSON, FastAPI will usually throw 422/400; we return a clean 400)
+    raw = await req.body()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Body must not be empty")
+
     try:
-        body = await req.json()
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Body must be valid JSON")
 
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="JSON must be an object")
 
-    # key: allow in JSON or query string
     key = str(body.get("key") or req.query_params.get("key") or "").strip()
     require_key(key)
 
-    # symbol: accept symbol or ticker
     sym = norm_symbol(str(body.get("symbol") or body.get("ticker") or ""))
     if not sym:
         raise HTTPException(status_code=400, detail="Missing symbol (use 'symbol' or 'ticker')")
 
-    # action: accept action or side
-    raw_action = str(body.get("action") or body.get("side") or "")
-    act = coerce_action(raw_action)
+    act = coerce_action(str(body.get("action") or body.get("side") or ""))
     if act not in ("BUY", "SELL"):
         raise HTTPException(status_code=400, detail="Invalid action (use BUY/SELL or buy/sell/long/short)")
 
-    updated_utc = str(body.get("ts") or "").strip() or now_utc_iso()
-    tv_id = str(body.get("id") or "")
+    ts = str(body.get("ts") or "").strip()
+    tv_id = str(body.get("id") or "").strip()
+
+    # Stable event key: prefer explicit id, then ts, else body-hash (TV retries are usually identical body)
+    event_key = f"{sym}|{tv_id}" if tv_id else (f"{sym}|{ts}" if ts else f"{sym}|sha1:{sha1_hex(raw)}")
+
+    con = db_connect()
+    cur = con.cursor()
+
+    # Try to insert event_key; if it already exists -> duplicate -> do nothing
+    try:
+        cur.execute(
+            "INSERT INTO tv_events(event_key, symbol, created_utc) VALUES(?,?,?)",
+            (event_key, sym, now_utc_iso()),
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        con.close()
+        return {"ok": True, "duplicate": True, "symbol": sym, "action": act, "event_key": event_key}
+
+    # IMPORTANT: updated_utc must be stable per event (use ts if present, else generate once here)
+    updated_utc = ts or now_utc_iso()
 
     payload = {
         "symbol": sym,
         "action": act,
         "updated_utc": updated_utc,
         "id": tv_id,
+        "event_key": event_key,
     }
 
-    con = db_connect()
-    cur = con.cursor()
     cur.execute(
         """
         INSERT INTO signals(symbol, updated_utc, action, payload_json, received_utc)
@@ -233,7 +262,7 @@ async def tv(req: Request) -> Dict[str, Any]:
     con.commit()
     con.close()
 
-    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
+    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act, "event_key": event_key}
 
 # --------------------------- LATEST (Per-Account) ---------------------------
 
@@ -255,7 +284,6 @@ def latest(
     payload = json.loads(row["payload_json"])
     upd = str(row["updated_utc"])
 
-    # Backward compatible: if account not given, always return latest (old behavior).
     if not account:
         con.close()
         return {"symbol": sym, "updated_utc": upd, "signal": payload}
