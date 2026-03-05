@@ -5,7 +5,14 @@
 # - Ignore TradingView ts/id completely
 # - updated_utc ONLY changes when action changes (BUY<->SELL)
 # - Extra protection: debounce action changes (anti flip-spam)
-#
+#@app.get("/hb")
+@app.post("/hb")
+def hb():
+    return {"ok": True}
+
+@app.get("/controls/effective")
+def controls_effective(symbol: str = "", since_version: int = 0):
+    return {"ok": True, "symbol": symbol, "since_version": since_version, "controls": {}}
 # Endpoints:
 #   GET  /                       -> health
 #   POST /tv                     -> ingest TradingView signal (key-protected, tolerant, HARD SAFE)
