@@ -1,27 +1,20 @@
 # app.py
-# FastAPI Signal Agent API (Copy/Paste) - v2 HARD SAFE MODE
-# Goals:
-# - 1 trade per account per signal (per-account ACK)
-# - Ignore TradingView ts/id completely
-# - updated_utc ONLY changes when action changes (BUY<->SELL)
-# - Extra protection: debounce action changes (anti flip-spam)
-#@app.get("/hb")
-@app.post("/hb")
-def hb():
-    return {"ok": True}
-
-@app.get("/controls/effective")
-def controls_effective(symbol: str = "", since_version: int = 0):
-    return {"ok": True, "symbol": symbol, "since_version": since_version, "controls": {}}
+# Signal Agent API v3 (Ultra-Stable, Render-safe, SQLite)
+# - HARD SAFE MODE: ignores ts/id completely; "new signal" only when direction changes
+# - Per-account ACK: 1 trade per account per signal (symbol + account + magic)
+# - Idempotent: repeated same-direction TV webhooks do NOT refresh updated_utc
+# - Includes stub routes: /hb and /controls/effective to stop 404 log spam
+#
 # Endpoints:
-#   GET  /                       -> health
-#   POST /tv                     -> ingest TradingView signal (key-protected, tolerant, HARD SAFE)
+#   GET  /                         -> health
+#   POST /tv                       -> ingest TradingView signal (key-protected)
 #   GET  /latest?symbol=...&account=...&magic=...
 #   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
 #   GET  /status/gate_combo?symbol=...
-#   POST /status/gate_combo      -> update gate levels (key-protected)
-#   POST /risk                   -> store initial risk snapshot (optional)
-#   GET  /debug/signal?symbol=... -> debug last stored signal (safe)
+#   POST /status/gate_combo        -> update gate (key-protected)
+#   POST /risk                     -> store initial risk snapshot (optional)
+#   GET/POST /hb                   -> stub (compat)
+#   GET /controls/effective        -> stub (compat)
 
 from __future__ import annotations
 
@@ -34,20 +27,15 @@ from typing import Optional, Literal, Any, Dict
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 
-
 # --------------------------- CONFIG ---------------------------
 
-APP_NAME = "Signal Agent API v2 (HardSafe, Per-Account ACK)"
+APP_NAME = "Signal Agent API v3 (Ultra-Stable)"
 SECRET = os.getenv("SECRET", "claus-2026-xau-01!")
 DB_PATH = os.getenv("DB_PATH", "agent.db")
 
-# Anti-spam: minimum seconds between ACCEPTED direction changes for the same symbol
-# (prevents rapid BUY->SELL->BUY flapping from indicator noise or duplicated alerts)
-DEBOUNCE_SEC = int(os.getenv("DEBOUNCE_SEC", "60"))
-
-# Optional: allow first-ever signal without debounce (recommended True)
-ALLOW_FIRST_SIGNAL_ALWAYS = os.getenv("ALLOW_FIRST_SIGNAL_ALWAYS", "1").strip() not in ("0", "false", "False")
-
+# Optional: protect /latest and /ack with same SECRET (recommended OFF for now)
+# If ON, EAs must add &key=SECRET to /latest and /ack
+PROTECT_LATEST_ACK = os.getenv("PROTECT_LATEST_ACK", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 
 # --------------------------- UTILS ---------------------------
 
@@ -72,27 +60,15 @@ def require_key(key: str) -> None:
     if not key or key != SECRET:
         raise HTTPException(status_code=401, detail="Invalid key")
 
+def maybe_require_key(key: str) -> None:
+    if not PROTECT_LATEST_ACK:
+        return
+    require_key(key)
+
 def db_connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
-
-def _iso_to_dt(iso: str) -> Optional[datetime]:
-    try:
-        # Python can parse ISO with timezone; if no timezone, assume UTC
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-def _seconds_since(iso: str) -> Optional[int]:
-    dt = _iso_to_dt(iso)
-    if not dt:
-        return None
-    return int((datetime.now(timezone.utc) - dt).total_seconds())
-
 
 # --------------------------- DB INIT ---------------------------
 
@@ -100,7 +76,7 @@ def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
 
-    # Keep schema stable to avoid migrations breaking on Render
+    # signals: one row per symbol
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS signals (
@@ -113,6 +89,7 @@ def db_init() -> None:
         """
     )
 
+    # per-account ACK
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS acks (
@@ -126,6 +103,7 @@ def db_init() -> None:
         """
     )
 
+    # gate status
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS gates (
@@ -138,6 +116,7 @@ def db_init() -> None:
         """
     )
 
+    # risk snapshots (optional)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS risks (
@@ -160,7 +139,6 @@ def db_init() -> None:
     con.commit()
     con.close()
 
-
 # --------------------------- MODELS ---------------------------
 
 class GateUpdate(BaseModel):
@@ -182,7 +160,6 @@ class RiskSnapshot(BaseModel):
     risk_usd: float
     source: str = "init_sl"
 
-
 # --------------------------- APP ---------------------------
 
 app = FastAPI(title=APP_NAME)
@@ -198,20 +175,29 @@ def root() -> Dict[str, Any]:
         "service": APP_NAME,
         "utc": now_utc_iso(),
         "db_path": DB_PATH,
-        "debounce_sec": DEBOUNCE_SEC,
+        "protect_latest_ack": PROTECT_LATEST_ACK,
     }
 
+# --------------------------- STUB ROUTES (stop 404 spam) ---------------------------
 
-# --------------------------- SIGNAL INGEST (HARD SAFE) ---------------------------
+@app.get("/hb")
+@app.post("/hb")
+def hb() -> Dict[str, Any]:
+    return {"ok": True, "utc": now_utc_iso()}
+
+@app.get("/controls/effective")
+def controls_effective(symbol: str = "", since_version: int = 0) -> Dict[str, Any]:
+    return {"ok": True, "symbol": symbol, "since_version": since_version, "controls": {}}
+
+# --------------------------- SIGNAL INGEST (v3 HARD SAFE MODE) ---------------------------
 
 @app.post("/tv")
 async def tv(req: Request) -> Dict[str, Any]:
     """
-    HARD SAFE MODE:
-    - Ignore TradingView ts/id completely (even if present).
-    - A "new" signal is created ONLY when action changes vs last stored for this symbol.
-    - Additional anti-spam: action change is ignored if it happens within DEBOUNCE_SEC
-      from the previous accepted change (per symbol). This prevents rapid flip storms.
+    v3 HARD SAFE MODE:
+    - We IGNORE ts and id completely (even if sender provides them).
+    - We create a "new signal" ONLY when action changes vs the last stored for this symbol.
+    - Repeated same-direction webhooks keep old updated_utc => EAs won't re-trade.
     """
     try:
         body = await req.json()
@@ -239,46 +225,17 @@ async def tv(req: Request) -> Dict[str, Any]:
     prev_upd = str(row["updated_utc"]) if row else ""
     prev_act = str(row["action"]) if row else ""
 
-    # Same direction => ALWAYS duplicate (no refresh). This kills "many trades per same signal".
     if prev_act == act and prev_upd:
+        # duplicate direction -> DO NOT refresh updated_utc
         con.close()
-        return {
-            "ok": True,
-            "duplicate": True,
-            "reason": "same_action_no_refresh",
-            "symbol": sym,
-            "updated_utc": prev_upd,
-            "action": act,
-        }
-
-    # Direction change => apply debounce protection
-    if row and prev_upd:
-        age_sec = _seconds_since(prev_upd)
-        if age_sec is not None and age_sec < DEBOUNCE_SEC:
-            # ignore flip spam
-            con.close()
-            return {
-                "ok": True,
-                "duplicate": True,
-                "reason": f"debounced_change<{DEBOUNCE_SEC}s",
-                "symbol": sym,
-                "updated_utc": prev_upd,
-                "action": prev_act,
-                "incoming_action": act,
-                "age_sec": age_sec,
-            }
-
-    # First ever signal: allow (option), otherwise also debounce not relevant
-    if not row and not ALLOW_FIRST_SIGNAL_ALWAYS:
-        # if user disables first-signal-allow, still accept (no prior), so this branch is mostly future-proof
-        pass
+        return {"ok": True, "duplicate": True, "symbol": sym, "updated_utc": prev_upd, "action": act}
 
     updated_utc = now_utc_iso()
     payload = {
         "symbol": sym,
         "action": act,
         "updated_utc": updated_utc,
-        # IMPORTANT: intentionally not storing ts/id
+        # intentionally not storing sender ts/id
     }
 
     cur.execute(
@@ -296,8 +253,7 @@ async def tv(req: Request) -> Dict[str, Any]:
     con.commit()
     con.close()
 
-    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act, "duplicate": False}
-
+    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
 
 # --------------------------- LATEST (Per-Account) ---------------------------
 
@@ -306,7 +262,10 @@ def latest(
     symbol: str = Query(...),
     account: Optional[str] = Query(None),
     magic: Optional[str] = Query(None),
+    key: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
+    maybe_require_key((key or "").strip())
+
     sym = norm_symbol(symbol)
     con = db_connect()
     cur = con.cursor()
@@ -319,6 +278,7 @@ def latest(
     payload = json.loads(row["payload_json"])
     upd = str(row["updated_utc"])
 
+    # if no account passed -> return raw signal
     if not account:
         con.close()
         return {"symbol": sym, "updated_utc": upd, "signal": payload}
@@ -338,7 +298,6 @@ def latest(
     con.close()
     return {"symbol": sym, "updated_utc": upd, "signal": payload, "acked": False}
 
-
 # --------------------------- ACK (Per-Account) ---------------------------
 
 @app.post("/ack")
@@ -347,7 +306,10 @@ def ack(
     updated_utc: str = Query(...),
     account: str = Query(...),
     magic: str = Query("0"),
+    key: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
+    maybe_require_key((key or "").strip())
+
     sym = norm_symbol(symbol)
     acc = str(account).strip()
     mag = str(magic).strip() if magic is not None else "0"
@@ -360,6 +322,7 @@ def ack(
 
     con = db_connect()
     cur = con.cursor()
+
     cur.execute(
         """
         INSERT INTO acks(symbol, account, magic, updated_utc, ack_utc)
@@ -374,7 +337,6 @@ def ack(
     con.close()
 
     return {"ok": True, "symbol": sym, "account": acc, "magic": mag, "updated_utc": upd}
-
 
 # --------------------------- GATE COMBO ---------------------------
 
@@ -422,7 +384,6 @@ def gate_combo_update(g: GateUpdate) -> Dict[str, Any]:
 
     return {"ok": True, "symbol": sym, "combo_level": g.combo_level, "utc": now_utc_iso()}
 
-
 # --------------------------- RISK SNAPSHOT ---------------------------
 
 @app.post("/risk")
@@ -451,24 +412,3 @@ def risk(snapshot: RiskSnapshot) -> Dict[str, Any]:
     con.commit()
     con.close()
     return {"ok": True}
-
-
-# --------------------------- DEBUG ---------------------------
-
-@app.get("/debug/signal")
-def debug_signal(symbol: str = Query(...)) -> Dict[str, Any]:
-    sym = norm_symbol(symbol)
-    con = db_connect()
-    cur = con.cursor()
-    row = cur.execute("SELECT * FROM signals WHERE symbol=?", (sym,)).fetchone()
-    con.close()
-    if not row:
-        return {"symbol": sym, "exists": False}
-    return {
-        "symbol": sym,
-        "exists": True,
-        "action": row["action"],
-        "updated_utc": row["updated_utc"],
-        "received_utc": row["received_utc"],
-        "payload": json.loads(row["payload_json"]),
-    }
