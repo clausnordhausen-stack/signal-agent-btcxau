@@ -1,9 +1,13 @@
 # app.py
-# Signal Agent API v3 (Ultra-Stable, Render-safe, SQLite)
-# - HARD SAFE MODE: ignores ts/id completely; "new signal" only when direction changes
-# - Per-account ACK: 1 trade per account per signal (symbol + account + magic)
-# - Idempotent: repeated same-direction TV webhooks do NOT refresh updated_utc
-# - Includes stub routes: /hb and /controls/effective to stop 404 log spam
+# Signal Agent API v3.1 (Ultra-Stable + Trade-Memory + Cooldown, Render-safe, SQLite)
+#
+# CORE:
+# - HARD SAFE MODE: ignores ts/id completely
+# - Trade-Memory (Direction-Lock): same-direction signals are ALWAYS ignored until direction changes
+# - Cooldown: direction changes are blocked for N seconds after last accepted direction change (per symbol)
+# - Per-account ACK: 1 trade per account per accepted signal (symbol + account + magic)
+# - SQLite persistence (Render-safe)
+# - Stub routes: /hb and /controls/effective to stop 404 spam
 #
 # Endpoints:
 #   GET  /                         -> health
@@ -13,9 +17,10 @@
 #   GET  /status/gate_combo?symbol=...
 #   POST /status/gate_combo        -> update gate (key-protected)
 #   POST /risk                     -> store initial risk snapshot (optional)
-#   GET/POST /hb                   -> stub (compat)
-#   GET /controls/effective        -> stub (compat)
-
+#   POST /reset                    -> reset one symbol (key-protected) (optional safety)
+#   GET/POST /hb                   -> stub
+#   GET /controls/effective        -> stub (returns cooldown map)
+#
 from __future__ import annotations
 
 import os
@@ -29,18 +34,26 @@ from pydantic import BaseModel
 
 # --------------------------- CONFIG ---------------------------
 
-APP_NAME = "Signal Agent API v3 (Ultra-Stable)"
+APP_NAME = "Signal Agent API v3.1 (Memory+Cooldown)"
 SECRET = os.getenv("SECRET", "claus-2026-xau-01!")
 DB_PATH = os.getenv("DB_PATH", "agent.db")
 
-# Optional: protect /latest and /ack with same SECRET (recommended OFF for now)
 # If ON, EAs must add &key=SECRET to /latest and /ack
 PROTECT_LATEST_ACK = os.getenv("PROTECT_LATEST_ACK", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
 
+# Cooldowns (seconds):
+# Option A (recommended): COOLDOWN_MAP_JSON='{"BTCUSD":600,"XAUUSD":300}'
+# Option B: set COOLDOWN_DEFAULT_SEC and per-symbol overrides COOLDOWN_BTCUSD, COOLDOWN_XAUUSD
+COOLDOWN_DEFAULT_SEC = int(os.getenv("COOLDOWN_DEFAULT_SEC", "0") or "0")
+COOLDOWN_MAP_JSON = os.getenv("COOLDOWN_MAP_JSON", "").strip()
+
 # --------------------------- UTILS ---------------------------
 
+def now_utc_dt() -> datetime:
+    return datetime.now(timezone.utc)
+
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return now_utc_dt().isoformat()
 
 def norm_symbol(s: str) -> str:
     return (s or "").strip().upper()
@@ -70,13 +83,47 @@ def db_connect() -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     return con
 
+def parse_iso_dt(s: str) -> Optional[datetime]:
+    try:
+        if not s:
+            return None
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def get_cooldown_sec(sym: str) -> int:
+    s = norm_symbol(sym)
+
+    # JSON map takes priority
+    if COOLDOWN_MAP_JSON:
+        try:
+            m = json.loads(COOLDOWN_MAP_JSON)
+            if isinstance(m, dict):
+                v = m.get(s)
+                if v is None:
+                    # allow common alt keys e.g. "BTC" etc. but keep simple
+                    return max(0, int(COOLDOWN_DEFAULT_SEC))
+                return max(0, int(v))
+        except Exception:
+            # if JSON is broken, fall back to env overrides/default
+            pass
+
+    # per-symbol override env: COOLDOWN_BTCUSD=600 etc.
+    env_key = f"COOLDOWN_{s}"
+    if env_key in os.environ:
+        try:
+            return max(0, int(os.environ.get(env_key, "0") or "0"))
+        except Exception:
+            return max(0, int(COOLDOWN_DEFAULT_SEC))
+
+    return max(0, int(COOLDOWN_DEFAULT_SEC))
+
 # --------------------------- DB INIT ---------------------------
 
 def db_init() -> None:
     con = db_connect()
     cur = con.cursor()
 
-    # signals: one row per symbol
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS signals (
@@ -89,7 +136,6 @@ def db_init() -> None:
         """
     )
 
-    # per-account ACK
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS acks (
@@ -103,7 +149,6 @@ def db_init() -> None:
         """
     )
 
-    # gate status
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS gates (
@@ -116,7 +161,6 @@ def db_init() -> None:
         """
     )
 
-    # risk snapshots (optional)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS risks (
@@ -160,6 +204,11 @@ class RiskSnapshot(BaseModel):
     risk_usd: float
     source: str = "init_sl"
 
+class ResetReq(BaseModel):
+    key: str
+    symbol: str
+    clear_acks: bool = True
+
 # --------------------------- APP ---------------------------
 
 app = FastAPI(title=APP_NAME)
@@ -170,12 +219,15 @@ def _startup() -> None:
 
 @app.get("/")
 def root() -> Dict[str, Any]:
+    # show effective cooldown hints without leaking secret
     return {
         "status": "ok",
         "service": APP_NAME,
         "utc": now_utc_iso(),
         "db_path": DB_PATH,
         "protect_latest_ack": PROTECT_LATEST_ACK,
+        "cooldown_default_sec": COOLDOWN_DEFAULT_SEC,
+        "cooldown_map_json_set": bool(COOLDOWN_MAP_JSON),
     }
 
 # --------------------------- STUB ROUTES (stop 404 spam) ---------------------------
@@ -187,17 +239,47 @@ def hb() -> Dict[str, Any]:
 
 @app.get("/controls/effective")
 def controls_effective(symbol: str = "", since_version: int = 0) -> Dict[str, Any]:
-    return {"ok": True, "symbol": symbol, "since_version": since_version, "controls": {}}
+    sym = norm_symbol(symbol) if symbol else ""
+    cd = get_cooldown_sec(sym) if sym else COOLDOWN_DEFAULT_SEC
+    return {
+        "ok": True,
+        "symbol": sym,
+        "since_version": since_version,
+        "controls": {
+            "cooldown_sec": cd,
+            "protect_latest_ack": PROTECT_LATEST_ACK,
+        },
+    }
 
-# --------------------------- SIGNAL INGEST (v3 HARD SAFE MODE) ---------------------------
+# --------------------------- RESET (optional safety) ---------------------------
+
+@app.post("/reset")
+def reset(req: ResetReq) -> Dict[str, Any]:
+    require_key(req.key)
+    sym = norm_symbol(req.symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    con = db_connect()
+    cur = con.cursor()
+
+    cur.execute("DELETE FROM signals WHERE symbol=?", (sym,))
+    if req.clear_acks:
+        cur.execute("DELETE FROM acks WHERE symbol=?", (sym,))
+
+    con.commit()
+    con.close()
+    return {"ok": True, "symbol": sym, "cleared_acks": bool(req.clear_acks)}
+
+# --------------------------- SIGNAL INGEST (Memory + Cooldown) ---------------------------
 
 @app.post("/tv")
 async def tv(req: Request) -> Dict[str, Any]:
     """
-    v3 HARD SAFE MODE:
-    - We IGNORE ts and id completely (even if sender provides them).
-    - We create a "new signal" ONLY when action changes vs the last stored for this symbol.
-    - Repeated same-direction webhooks keep old updated_utc => EAs won't re-trade.
+    HARD SAFE MODE + Trade-Memory + Cooldown:
+    - Ignore sender ts/id completely.
+    - SAME-DIRECTION signals are ALWAYS duplicates => no updated_utc refresh => no re-trade.
+    - Opposite-direction signals are accepted ONLY if cooldown has passed since last accepted change.
     """
     try:
         body = await req.json()
@@ -225,18 +307,33 @@ async def tv(req: Request) -> Dict[str, Any]:
     prev_upd = str(row["updated_utc"]) if row else ""
     prev_act = str(row["action"]) if row else ""
 
+    # ---- Trade-Memory: same direction is ALWAYS duplicate
     if prev_act == act and prev_upd:
-        # duplicate direction -> DO NOT refresh updated_utc
         con.close()
         return {"ok": True, "duplicate": True, "symbol": sym, "updated_utc": prev_upd, "action": act}
 
+    # ---- Cooldown only applies when direction is changing (or first ever)
+    cooldown_sec = get_cooldown_sec(sym)
+    if prev_upd and cooldown_sec > 0:
+        dt_prev = parse_iso_dt(prev_upd)
+        if dt_prev is not None:
+            age = (now_utc_dt() - dt_prev).total_seconds()
+            if age < float(cooldown_sec):
+                # Block direction change
+                con.close()
+                return {
+                    "ok": True,
+                    "blocked_cooldown": True,
+                    "symbol": sym,
+                    "requested_action": act,
+                    "current_action": prev_act,
+                    "current_updated_utc": prev_upd,
+                    "cooldown_sec": cooldown_sec,
+                    "seconds_remaining": int(max(0.0, float(cooldown_sec) - age)),
+                }
+
     updated_utc = now_utc_iso()
-    payload = {
-        "symbol": sym,
-        "action": act,
-        "updated_utc": updated_utc,
-        # intentionally not storing sender ts/id
-    }
+    payload = {"symbol": sym, "action": act, "updated_utc": updated_utc}
 
     cur.execute(
         """
@@ -253,7 +350,7 @@ async def tv(req: Request) -> Dict[str, Any]:
     con.commit()
     con.close()
 
-    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act}
+    return {"ok": True, "symbol": sym, "updated_utc": updated_utc, "action": act, "cooldown_sec": cooldown_sec}
 
 # --------------------------- LATEST (Per-Account) ---------------------------
 
@@ -278,7 +375,7 @@ def latest(
     payload = json.loads(row["payload_json"])
     upd = str(row["updated_utc"])
 
-    # if no account passed -> return raw signal
+    # If no account passed -> raw signal
     if not account:
         con.close()
         return {"symbol": sym, "updated_utc": upd, "signal": payload}
@@ -322,7 +419,6 @@ def ack(
 
     con = db_connect()
     cur = con.cursor()
-
     cur.execute(
         """
         INSERT INTO acks(symbol, account, magic, updated_utc, ack_utc)
