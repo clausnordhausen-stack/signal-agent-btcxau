@@ -1,105 +1,133 @@
-from __future__ import annotations
+# app.py
+# FastAPI Signal Agent API
+#
+# HARD RULES:
+# - Exactly ONE executable signal per symbol at a time
+# - Exclusive claim: only one account/magic can receive a pending signal
+# - ACK starts a hard 30-minute cooldown per symbol
+# - During cooldown, ALL new TV signals for that symbol are ignored
+# - Repeated / re-sent / new-id signals are ignored while pending or cooling down
+# - Pending signals auto-expire if not ACKed in time (prevents deadlock)
+#
+# ENDPOINTS:
+#   GET  /
+#   POST /tv
+#   GET  /latest?symbol=...&account=...&magic=...
+#   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
+#   GET  /status/gate_combo?symbol=...
+#   POST /risk
+#   GET  /debug/state?symbol=...
+#
+# START:
+#   uvicorn app:app --host 0.0.0.0 --port 10000
 
-import os
-import json
-import hashlib
-import sqlite3
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Literal, Any, Dict
-
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any
+import hashlib
+import os
+import sqlite3
+import threading
 
-# =========================================================
+app = FastAPI(title="Signal Agent API", version="2.1.0")
+
+# -------------------------------------------------------------------
 # CONFIG
-# =========================================================
+# -------------------------------------------------------------------
+SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
+DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 
-APP_NAME = "Signal Agent API v5 - Prop Firm Safe Execution Engine"
-
-SECRET = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
-DB_PATH = os.getenv("DB_PATH", "agent.db")
-
-# Claim TTL: wie lange ein Konto exklusiv ein Signal reservieren darf
+# hard rules
+SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 CLAIM_TTL_SEC = int(os.getenv("CLAIM_TTL_SEC", "20"))
+PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", "120"))  # prevents deadlock
+DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
-# Cooldown pro Symbol
-DEFAULT_COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", "30"))
-BTC_COOLDOWN_MIN = int(os.getenv("BTC_COOLDOWN_MIN", str(DEFAULT_COOLDOWN_MIN)))
-XAU_COOLDOWN_MIN = int(os.getenv("XAU_COOLDOWN_MIN", str(DEFAULT_COOLDOWN_MIN)))
+DB_LOCK = threading.Lock()
 
-# Optional: ACK schützen
-PROTECT_LATEST_ACK = os.getenv("PROTECT_LATEST_ACK", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
+# -------------------------------------------------------------------
+# MODELS
+# -------------------------------------------------------------------
+class TVSignal(BaseModel):
+    key: str
+    symbol: str
+    action: str          # BUY / SELL
+    ts: Optional[str] = None
+    id: Optional[str] = None
 
+class RiskEvent(BaseModel):
+    account: Optional[str] = None
+    symbol: str
+    position_id: Optional[str] = None
+    magic: Optional[int] = None
+    open_time: Optional[str] = None
+    entry_price: Optional[float] = None
+    sl: Optional[float] = None
+    lots: Optional[float] = None
+    risk_usd: Optional[float] = None
+    source: Optional[str] = None
 
-# =========================================================
-# HELPERS
-# =========================================================
-
+# -------------------------------------------------------------------
+# TIME / HELPERS
+# -------------------------------------------------------------------
 def now_utc_dt() -> datetime:
     return datetime.now(timezone.utc)
 
 def now_utc_iso() -> str:
     return now_utc_dt().isoformat()
 
-def norm_symbol(s: str) -> str:
-    return (s or "").strip().upper()
+def parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def secs_left(future_dt: Optional[datetime]) -> int:
+    if future_dt is None:
+        return 0
+    left = int((future_dt - now_utc_dt()).total_seconds())
+    return max(0, left)
+
+def norm_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+
+    # gold aliases -> canonical XAUUSD
+    if s in {"GOLD", "XAU", "XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"}:
+        return "XAUUSD"
+
+    # btc aliases -> canonical BTCUSD
+    if s in {"BTC", "BTCUSD", "BITCOIN", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"}:
+        return "BTCUSD"
+
+    return s
 
 def norm_action(a: str) -> str:
     return (a or "").strip().upper()
 
-def coerce_action(a: str) -> str:
-    x = norm_action(a)
-    if x in ("BUY", "LONG"):
-        return "BUY"
-    if x in ("SELL", "SHORT"):
-        return "SELL"
-    return ""
+def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
+    raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-def require_key(key: str) -> None:
-    if not key or key != SECRET:
-        raise HTTPException(status_code=401, detail="Invalid key")
+# -------------------------------------------------------------------
+# DB
+# -------------------------------------------------------------------
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def maybe_require_key(key: str) -> None:
-    if PROTECT_LATEST_ACK:
-        require_key(key)
+def init_db() -> None:
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
 
-def parse_iso(ts: Optional[str]) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-def get_cooldown_min(symbol: str) -> int:
-    s = norm_symbol(symbol)
-    if s == "BTCUSD":
-        return BTC_COOLDOWN_MIN
-    if s == "XAUUSD":
-        return XAU_COOLDOWN_MIN
-    return DEFAULT_COOLDOWN_MIN
-
-
-# =========================================================
-# DATABASE
-# =========================================================
-
-def db_connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, check_same_thread=False)
-    con.row_factory = sqlite3.Row
-    return con
-
-def db_init() -> None:
-    con = db_connect()
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS signal_state (
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_state (
             symbol TEXT PRIMARY KEY,
+
             pending_action TEXT,
             pending_updated_utc TEXT,
             pending_tv_id TEXT,
@@ -111,7 +139,8 @@ def db_init() -> None:
             claimed_by_magic TEXT,
             claim_until_utc TEXT,
 
-            globally_acked INTEGER DEFAULT 0,
+            globally_acked INTEGER NOT NULL DEFAULT 0,
+
             cooldown_until_utc TEXT,
 
             last_executed_updated_utc TEXT,
@@ -125,726 +154,571 @@ def db_init() -> None:
 
             updated_utc TEXT NOT NULL
         )
-        """
-    )
+        """)
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS acks (
-            symbol TEXT NOT NULL,
-            account TEXT NOT NULL,
-            magic TEXT NOT NULL,
-            updated_utc TEXT NOT NULL,
-            ack_utc TEXT NOT NULL,
-            PRIMARY KEY(symbol, account, magic, updated_utc)
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS gates (
-            symbol TEXT PRIMARY KEY,
-            combo_level TEXT NOT NULL,
-            usd_level TEXT NOT NULL,
-            r_level TEXT NOT NULL,
-            updated_utc TEXT NOT NULL
-        )
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS risks (
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account TEXT NOT NULL,
+            created_utc TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            position_id TEXT NOT NULL,
-            magic INTEGER NOT NULL,
-            open_time TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            sl REAL NOT NULL,
-            lots REAL NOT NULL,
-            risk_usd REAL NOT NULL,
-            source TEXT NOT NULL,
-            received_utc TEXT NOT NULL
+            action TEXT,
+            tv_id TEXT,
+            tv_ts TEXT,
+            updated_utc TEXT,
+            status TEXT NOT NULL,
+            note TEXT,
+            payload_hash TEXT
         )
-        """
-    )
+        """)
 
-    con.commit()
-    con.close()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS risk_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_utc TEXT NOT NULL,
+            account TEXT,
+            symbol TEXT NOT NULL,
+            position_id TEXT,
+            magic INTEGER,
+            open_time TEXT,
+            entry_price REAL,
+            sl REAL,
+            lots REAL,
+            risk_usd REAL,
+            source TEXT
+        )
+        """)
 
-
-# =========================================================
-# MODELS
-# =========================================================
-
-class TVSignal(BaseModel):
-    key: str
-    symbol: str
-    action: str
-    ts: Optional[str] = None
-    id: Optional[str] = None
-
-class GateUpdate(BaseModel):
-    key: str
-    symbol: str
-    combo_level: Literal["GREEN", "YELLOW", "RED"] = "GREEN"
-    usd_level: str = "UNKNOWN"
-    r_level: str = "UNKNOWN"
-
-class RiskSnapshot(BaseModel):
-    account: str
-    symbol: str
-    position_id: str
-    magic: int
-    open_time: str
-    entry_price: float
-    sl: float
-    lots: float
-    risk_usd: float
-    source: str = "init_sl"
-
-class ManualSignal(BaseModel):
-    key: str
-    symbol: str
-    action: str
-
-class ResetReq(BaseModel):
-    key: str
-    symbol: str
-    clear_acks: bool = True
-    clear_cooldown: bool = False
-
-
-# =========================================================
-# APP
-# =========================================================
-
-app = FastAPI(title=APP_NAME)
+        conn.commit()
+        conn.close()
 
 @app.on_event("startup")
-def _startup() -> None:
-    db_init()
+def startup() -> None:
+    init_db()
 
+def get_state(conn: sqlite3.Connection, symbol: str) -> Optional[sqlite3.Row]:
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM symbol_state WHERE symbol = ?", (symbol,))
+    return cur.fetchone()
 
-# =========================================================
-# ROOT / HEALTH
-# =========================================================
-
-@app.get("/")
-def root() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "cooldown_min": DEFAULT_COOLDOWN_MIN,
-        "claim_ttl_sec": CLAIM_TTL_SEC,
-        "utc": now_utc_iso(),
-    }
-
-
-# =========================================================
-# STUB ROUTES
-# =========================================================
-
-@app.get("/hb")
-@app.post("/hb")
-def hb() -> Dict[str, Any]:
-    return {"ok": True, "utc": now_utc_iso()}
-
-@app.get("/controls/effective")
-def controls_effective(symbol: str = "", since_version: int = 0) -> Dict[str, Any]:
-    sym = norm_symbol(symbol)
-    return {
-        "ok": True,
-        "symbol": sym,
-        "since_version": since_version,
-        "controls": {
-            "cooldown_min": get_cooldown_min(sym),
-            "claim_ttl_sec": CLAIM_TTL_SEC,
-        },
-    }
-
-
-# =========================================================
-# INTERNAL STATE HELPERS
-# =========================================================
-
-def get_state_row(cur: sqlite3.Cursor, symbol: str):
-    row = cur.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
-    if row:
+def upsert_empty_state(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
+    row = get_state(conn, symbol)
+    if row is not None:
         return row
 
-    cur.execute(
-        """
-        INSERT INTO signal_state(symbol, updated_utc)
-        VALUES(?, ?)
-        """,
-        (symbol, now_utc_iso()),
-    )
-    return cur.execute("SELECT * FROM signal_state WHERE symbol=?", (symbol,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO symbol_state (
+            symbol,
+            globally_acked,
+            updated_utc
+        ) VALUES (?, 0, ?)
+    """, (symbol, now_utc_iso()))
+    conn.commit()
+    return get_state(conn, symbol)
 
-def update_state(cur: sqlite3.Cursor, symbol: str, fields: dict):
-    if not fields:
+def log_signal(conn: sqlite3.Connection,
+               symbol: str,
+               action: Optional[str],
+               tv_id: Optional[str],
+               tv_ts: Optional[str],
+               updated_utc: Optional[str],
+               status: str,
+               note: str,
+               phash: Optional[str]) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO signal_log (
+            created_utc, symbol, action, tv_id, tv_ts, updated_utc,
+            status, note, payload_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        now_utc_iso(), symbol, action, tv_id, tv_ts, updated_utc,
+        status, note, phash
+    ))
+    conn.commit()
+
+def clear_pending(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
+    row = get_state(conn, symbol)
+    if row is None:
         return
-    fields = dict(fields)
-    fields["updated_utc"] = now_utc_iso()
 
-    sets = ", ".join([f"{k}=?" for k in fields.keys()])
-    vals = list(fields.values()) + [symbol]
+    if not row["pending_updated_utc"]:
+        return
 
-    cur.execute(f"UPDATE signal_state SET {sets} WHERE symbol=?", vals)
+    log_signal(
+        conn=conn,
+        symbol=symbol,
+        action=row["pending_action"],
+        tv_id=row["pending_tv_id"],
+        tv_ts=row["pending_tv_ts"],
+        updated_utc=row["pending_updated_utc"],
+        status="expired_pending",
+        note=reason,
+        phash=row["pending_payload_hash"],
+    )
 
-def is_claim_active(row) -> bool:
-    claim_until = parse_iso(row["claim_until_utc"])
-    if not claim_until:
-        return False
-    return claim_until > now_utc_dt()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE symbol_state
+        SET
+            pending_action = NULL,
+            pending_updated_utc = NULL,
+            pending_tv_id = NULL,
+            pending_tv_ts = NULL,
+            pending_payload_hash = NULL,
+            pending_created_utc = NULL,
 
-def is_cooldown_active(row) -> bool:
-    cd = parse_iso(row["cooldown_until_utc"])
-    if not cd:
-        return False
-    return cd > now_utc_dt()
+            claimed_by_account = NULL,
+            claimed_by_magic = NULL,
+            claim_until_utc = NULL,
 
-def clear_expired_claim_if_needed(cur: sqlite3.Cursor, row):
-    if row["claim_until_utc"]:
-        dt = parse_iso(row["claim_until_utc"])
-        if dt and dt <= now_utc_dt():
-            update_state(cur, row["symbol"], {
-                "claimed_by_account": None,
-                "claimed_by_magic": None,
-                "claim_until_utc": None,
-            })
+            globally_acked = 0,
+            updated_utc = ?
+        WHERE symbol = ?
+    """, (now_utc_iso(), symbol))
+    conn.commit()
 
+def expire_pending_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
+    row = upsert_empty_state(conn, symbol)
 
-# =========================================================
-# SIGNAL INGEST
-# =========================================================
+    if not row["pending_updated_utc"]:
+        return row
 
-@app.post("/tv")
-async def tv(req: Request) -> Dict[str, Any]:
-    """
-    HARD SAFE:
-    - gleiches Signal gleicher Richtung -> duplicate
-    - Signal in Cooldown -> blockiert
-    - neues Signal setzt pending_* neu
-    - Claim/ACK werden zurückgesetzt
-    """
-    try:
-        body = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Body must be valid JSON")
-
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="JSON must be an object")
-
-    key = str(body.get("key") or req.query_params.get("key") or "").strip()
-    require_key(key)
-
-    symbol = norm_symbol(str(body.get("symbol") or body.get("ticker") or ""))
-    if not symbol:
-        raise HTTPException(status_code=400, detail="Missing symbol")
-
-    action = coerce_action(str(body.get("action") or body.get("side") or ""))
-    if action not in ("BUY", "SELL"):
-        raise HTTPException(status_code=400, detail="Invalid action")
-
-    # bewusst nur für Debug gespeichert, nicht für Logik verwendet
-    tv_id = str(body.get("id") or "").strip() or None
-    tv_ts = str(body.get("ts") or "").strip() or None
-
-    payload_min = {
-        "symbol": symbol,
-        "action": action,
-    }
-    payload_hash = sha256_text(json.dumps(payload_min, sort_keys=True))
-
-    con = db_connect()
-    cur = con.cursor()
-
-    row = get_state_row(cur, symbol)
-    clear_expired_claim_if_needed(cur, row)
-    row = get_state_row(cur, symbol)
-
-    # Dedupe: gleiche Richtung wie last_seen_action + gleicher Payload-Hash => ignorieren
-    if row["last_seen_action"] == action and row["last_seen_payload_hash"] == payload_hash:
-        con.commit()
-        con.close()
-        return {
-            "status": "duplicate",
-            "symbol": symbol,
-            "action": action,
-            "updated_utc": row["updated_utc"],
-        }
-
-    # Cooldown blockiert neue Signale
-    if is_cooldown_active(row):
-        con.commit()
-        con.close()
-        return {
-            "status": "blocked_cooldown",
-            "symbol": symbol,
-            "action": action,
-            "cooldown_until_utc": row["cooldown_until_utc"],
-        }
-
-    pending_updated_utc = now_utc_iso()
-
-    update_state(cur, symbol, {
-        "pending_action": action,
-        "pending_updated_utc": pending_updated_utc,
-        "pending_tv_id": tv_id,
-        "pending_tv_ts": tv_ts,
-        "pending_payload_hash": payload_hash,
-        "pending_created_utc": pending_updated_utc,
-
-        "claimed_by_account": None,
-        "claimed_by_magic": None,
-        "claim_until_utc": None,
-
-        "globally_acked": 0,
-
-        "last_seen_tv_id": tv_id,
-        "last_seen_tv_ts": tv_ts,
-        "last_seen_action": action,
-        "last_seen_payload_hash": payload_hash,
-    })
-
-    con.commit()
-    con.close()
-
-    return {
-        "status": "accepted",
-        "symbol": symbol,
-        "action": action,
-        "updated_utc": pending_updated_utc,
-    }
-
-
-# =========================================================
-# MANUAL TEST ROUTE
-# =========================================================
-
-@app.get("/manual_signal")
-def manual_signal(
-    symbol: str = Query(...),
-    action: str = Query(...),
-    key: str = Query(...),
-) -> Dict[str, Any]:
-    require_key(key)
-
-    symbol_n = norm_symbol(symbol)
-    action_n = coerce_action(action)
-    if action_n not in ("BUY", "SELL"):
-        raise HTTPException(status_code=400, detail="Invalid action")
-
-    con = db_connect()
-    cur = con.cursor()
-
-    row = get_state_row(cur, symbol_n)
-    clear_expired_claim_if_needed(cur, row)
-    row = get_state_row(cur, symbol_n)
-
-    payload_hash = sha256_text(json.dumps({"symbol": symbol_n, "action": action_n}, sort_keys=True))
-
-    if row["last_seen_action"] == action_n and row["last_seen_payload_hash"] == payload_hash:
-        con.commit()
-        con.close()
-        return {
-            "status": "duplicate",
-            "symbol": symbol_n,
-            "action": action_n,
-            "updated_utc": row["updated_utc"],
-        }
-
-    if is_cooldown_active(row):
-        con.commit()
-        con.close()
-        return {
-            "status": "blocked_cooldown",
-            "symbol": symbol_n,
-            "action": action_n,
-            "cooldown_until_utc": row["cooldown_until_utc"],
-        }
-
-    pending_updated_utc = now_utc_iso()
-
-    update_state(cur, symbol_n, {
-        "pending_action": action_n,
-        "pending_updated_utc": pending_updated_utc,
-        "pending_tv_id": None,
-        "pending_tv_ts": None,
-        "pending_payload_hash": payload_hash,
-        "pending_created_utc": pending_updated_utc,
-
-        "claimed_by_account": None,
-        "claimed_by_magic": None,
-        "claim_until_utc": None,
-
-        "globally_acked": 0,
-
-        "last_seen_tv_id": None,
-        "last_seen_tv_ts": None,
-        "last_seen_action": action_n,
-        "last_seen_payload_hash": payload_hash,
-    })
-
-    con.commit()
-    con.close()
-
-    return {
-        "status": "accepted",
-        "symbol": symbol_n,
-        "action": action_n,
-        "updated_utc": pending_updated_utc,
-    }
-
-
-# =========================================================
-# LATEST FOR EA
-# =========================================================
-
-@app.get("/latest")
-def latest(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: str = Query(...),
-    key: Optional[str] = Query(None),
-) -> Dict[str, Any]:
-    maybe_require_key((key or "").strip())
-
-    symbol_n = norm_symbol(symbol)
-    account_n = str(account).strip()
-    magic_n = str(magic).strip()
-
-    con = db_connect()
-    cur = con.cursor()
-
-    row = get_state_row(cur, symbol_n)
-    clear_expired_claim_if_needed(cur, row)
-    row = get_state_row(cur, symbol_n)
-
-    # nichts pending
-    if not row["pending_action"] or not row["pending_updated_utc"]:
-        con.commit()
-        con.close()
-        return {
-            "symbol": symbol_n,
-            "updated_utc": "",
-            "signal": None,
-        }
-
-    # schon global abgeschlossen
     if int(row["globally_acked"] or 0) == 1:
-        con.commit()
-        con.close()
-        return {
-            "symbol": symbol_n,
-            "updated_utc": row["pending_updated_utc"],
-            "signal": None,
-            "acked": True,
-        }
+        return row
 
-    # hat dieses Konto dieses konkrete Signal schon bestätigt?
-    ack = cur.execute(
-        """
-        SELECT 1 FROM acks
-        WHERE symbol=? AND account=? AND magic=? AND updated_utc=?
-        LIMIT 1
-        """,
-        (symbol_n, account_n, magic_n, row["pending_updated_utc"]),
-    ).fetchone()
+    pending_created = parse_iso(row["pending_created_utc"])
+    if pending_created is None:
+        clear_pending(conn, symbol, "pending had no valid created timestamp")
+        return get_state(conn, symbol)
 
-    if ack:
-        con.commit()
-        con.close()
-        return {
-            "symbol": symbol_n,
-            "updated_utc": row["pending_updated_utc"],
-            "signal": None,
-            "acked": True,
-        }
+    age_sec = int((now_utc_dt() - pending_created).total_seconds())
+    if age_sec >= PENDING_TTL_SEC:
+        clear_pending(conn, symbol, f"pending expired after {age_sec}s without ACK")
+        return get_state(conn, symbol)
 
-    # exklusiver Claim: entweder frei oder schon von genau diesem Konto/Magic
-    claim_active = is_claim_active(row)
-    same_claimer = (row["claimed_by_account"] == account_n and row["claimed_by_magic"] == magic_n)
+    return row
 
-    if claim_active and not same_claimer:
-        con.commit()
-        con.close()
-        return {
-            "symbol": symbol_n,
-            "updated_utc": row["pending_updated_utc"],
-            "signal": None,
-            "claimed": True,
-            "claimed_by_account": row["claimed_by_account"],
-            "claimed_by_magic": row["claimed_by_magic"],
-        }
-
-    # Claim setzen/verlängern
-    claim_until = (now_utc_dt() + timedelta(seconds=CLAIM_TTL_SEC)).isoformat()
-    update_state(cur, symbol_n, {
-        "claimed_by_account": account_n,
-        "claimed_by_magic": magic_n,
-        "claim_until_utc": claim_until,
-    })
-
-    row = get_state_row(cur, symbol_n)
-
-    con.commit()
-    con.close()
-
+# -------------------------------------------------------------------
+# ROOT
+# -------------------------------------------------------------------
+@app.get("/")
+def root() -> dict[str, Any]:
     return {
-        "symbol": symbol_n,
-        "updated_utc": row["pending_updated_utc"],
-        "signal": {
-            "symbol": symbol_n,
-            "action": row["pending_action"],
-        },
-        "claimed": True,
-        "claim_until_utc": claim_until,
+        "status": "ok",
+        "service": "Signal Agent API",
+        "cooldown_min": SYMBOL_COOLDOWN_MIN,
+        "claim_ttl_sec": CLAIM_TTL_SEC,
+        "pending_ttl_sec": PENDING_TTL_SEC,
     }
 
+# -------------------------------------------------------------------
+# TV INGEST
+# -------------------------------------------------------------------
+@app.post("/tv")
+def tv(signal: TVSignal) -> dict[str, Any]:
+    if signal.key != SECRET_KEY:
+        raise HTTPException(status_code=401, detail="invalid key")
 
-# =========================================================
-# ACK
-# =========================================================
+    symbol = norm_symbol(signal.symbol)
+    action = norm_action(signal.action)
+    tv_id = (signal.id or "").strip()
+    tv_ts = (signal.ts or "").strip()
+    phash = payload_hash(symbol, action, tv_id, tv_ts)
 
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if action not in ("BUY", "SELL"):
+        raise HTTPException(status_code=400, detail="action must be BUY or SELL")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_pending_if_needed(conn, symbol)
+
+        now = now_utc_dt()
+        cooldown_until = parse_iso(row["cooldown_until_utc"])
+
+        # hard cooldown: ignore absolutely everything during cooldown
+        if cooldown_until and now < cooldown_until:
+            left = secs_left(cooldown_until)
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, None,
+                "ignored_cooldown",
+                f"cooldown active, {left}s left",
+                phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_cooldown",
+                "symbol": symbol,
+                "action": action,
+                "cooldown_left_sec": left
+            }
+
+        # if pending exists and is still valid, ignore all further TV events
+        if row["pending_updated_utc"] and int(row["globally_acked"] or 0) == 0:
+            age_sec = int((now - parse_iso(row["pending_created_utc"])).total_seconds()) if row["pending_created_utc"] else 0
+            left = max(0, PENDING_TTL_SEC - age_sec)
+
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, row["pending_updated_utc"],
+                "ignored_pending_exists",
+                f"another signal is still pending, ttl_left={left}s",
+                phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_pending_exists",
+                "symbol": symbol,
+                "pending_updated_utc": row["pending_updated_utc"],
+                "pending_ttl_left_sec": left
+            }
+
+        # duplicate exact payload guard
+        if row["last_seen_payload_hash"] == phash:
+            log_signal(
+                conn, symbol, action, tv_id, tv_ts, None,
+                "ignored_duplicate_payload",
+                "same payload hash already seen",
+                phash
+            )
+            conn.close()
+            return {
+                "status": "ignored_duplicate_payload",
+                "symbol": symbol
+            }
+
+        updated_utc = now_utc_iso()
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE symbol_state
+            SET
+                pending_action = ?,
+                pending_updated_utc = ?,
+                pending_tv_id = ?,
+                pending_tv_ts = ?,
+                pending_payload_hash = ?,
+                pending_created_utc = ?,
+
+                claimed_by_account = NULL,
+                claimed_by_magic = NULL,
+                claim_until_utc = NULL,
+
+                globally_acked = 0,
+
+                last_seen_tv_id = ?,
+                last_seen_tv_ts = ?,
+                last_seen_action = ?,
+                last_seen_payload_hash = ?,
+
+                updated_utc = ?
+            WHERE symbol = ?
+        """, (
+            action,
+            updated_utc,
+            tv_id or None,
+            tv_ts or None,
+            phash,
+            updated_utc,
+
+            tv_id or None,
+            tv_ts or None,
+            action,
+            phash,
+
+            updated_utc,
+            symbol
+        ))
+        conn.commit()
+
+        log_signal(
+            conn, symbol, action, tv_id, tv_ts, updated_utc,
+            "accepted",
+            "signal accepted as exclusive pending signal",
+            phash
+        )
+
+        conn.close()
+        return {
+            "status": "accepted",
+            "symbol": symbol,
+            "action": action,
+            "updated_utc": updated_utc
+        }
+
+# -------------------------------------------------------------------
+# LATEST (exclusive claim)
+# -------------------------------------------------------------------
+@app.get("/latest")
+def latest(symbol: str,
+           account: Optional[str] = Query(default=None),
+           magic: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    acc = (account or "").strip()
+    mag = (magic or "").strip()
+
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_pending_if_needed(conn, sym)
+
+        now = now_utc_dt()
+        cooldown_until = parse_iso(row["cooldown_until_utc"])
+        claim_until = parse_iso(row["claim_until_utc"])
+
+        # if cooldown active: return null
+        if cooldown_until and now < cooldown_until:
+            left = secs_left(cooldown_until)
+            conn.close()
+            return {
+                "symbol": sym,
+                "signal": None,
+                "updated_utc": "",
+                "cooldown_left_sec": left
+            }
+
+        # if no pending signal: return null
+        if not row["pending_updated_utc"] or int(row["globally_acked"] or 0) == 1:
+            conn.close()
+            return {
+                "symbol": sym,
+                "signal": None,
+                "updated_utc": "",
+                "cooldown_left_sec": 0
+            }
+
+        # another account/magic already holds a live claim
+        if row["claimed_by_account"] and row["claimed_by_magic"] and claim_until and now < claim_until:
+            if not (row["claimed_by_account"] == acc and row["claimed_by_magic"] == mag):
+                conn.close()
+                return {
+                    "symbol": sym,
+                    "signal": None,
+                    "updated_utc": "",
+                    "cooldown_left_sec": 0
+                }
+
+        # create / refresh claim for this requester
+        claim_until_utc = (now + timedelta(seconds=CLAIM_TTL_SEC)).isoformat()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE symbol_state
+            SET
+                claimed_by_account = ?,
+                claimed_by_magic = ?,
+                claim_until_utc = ?,
+                updated_utc = ?
+            WHERE symbol = ?
+        """, (
+            acc or None,
+            mag or None,
+            claim_until_utc,
+            now.isoformat(),
+            sym
+        ))
+        conn.commit()
+
+        action = row["pending_action"]
+        updated_utc = row["pending_updated_utc"]
+
+        conn.close()
+        return {
+            "symbol": sym,
+            "updated_utc": updated_utc,
+            "signal": {
+                "symbol": sym,
+                "action": action
+            },
+            "claimed_by_account": acc,
+            "claimed_by_magic": mag,
+            "claim_ttl_sec": CLAIM_TTL_SEC,
+            "cooldown_left_sec": 0
+        }
+
+# -------------------------------------------------------------------
+# ACK (global execute lock + cooldown start)
+# -------------------------------------------------------------------
 @app.post("/ack")
-def ack(
-    symbol: str = Query(...),
-    updated_utc: str = Query(...),
-    account: str = Query(...),
-    magic: str = Query(...),
-    key: Optional[str] = Query(None),
-) -> Dict[str, Any]:
-    maybe_require_key((key or "").strip())
+def ack(symbol: str,
+        updated_utc: str,
+        account: Optional[str] = Query(default=None),
+        magic: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    acc = (account or "").strip()
+    mag = (magic or "").strip()
+    upd = (updated_utc or "").strip()
 
-    symbol_n = norm_symbol(symbol)
-    account_n = str(account).strip()
-    magic_n = str(magic).strip()
-    updated_n = str(updated_utc).strip()
+    if not sym or not upd:
+        raise HTTPException(status_code=400, detail="symbol and updated_utc required")
 
-    if not updated_n:
-        raise HTTPException(status_code=400, detail="updated_utc required")
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_pending_if_needed(conn, sym)
+        now = now_utc_dt()
 
-    con = db_connect()
-    cur = con.cursor()
+        # duplicate ACK to already executed signal
+        if row["last_executed_updated_utc"] == upd:
+            cooldown_until = parse_iso(row["cooldown_until_utc"])
+            left = secs_left(cooldown_until)
+            conn.close()
+            return {
+                "status": "already_acked",
+                "symbol": sym,
+                "updated_utc": upd,
+                "cooldown_left_sec": left
+            }
 
-    row = get_state_row(cur, symbol_n)
+        # must match current pending signal
+        if row["pending_updated_utc"] != upd:
+            conn.close()
+            return {
+                "status": "ignored_unknown_updated_utc",
+                "symbol": sym,
+                "updated_utc": upd
+            }
 
-    if row["pending_updated_utc"] != updated_n:
-        con.commit()
-        con.close()
+        # only current claimer may ACK
+        if row["claimed_by_account"] and row["claimed_by_magic"]:
+            if row["claimed_by_account"] != acc or row["claimed_by_magic"] != mag:
+                conn.close()
+                return {
+                    "status": "ignored_not_claimer",
+                    "symbol": sym,
+                    "updated_utc": upd
+                }
+
+        pending_action = row["pending_action"]
+        pending_tv_id = row["pending_tv_id"]
+        pending_tv_ts = row["pending_tv_ts"]
+        pending_hash = row["pending_payload_hash"]
+
+        cooldown_until_utc = (now + timedelta(minutes=SYMBOL_COOLDOWN_MIN)).isoformat()
+
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE symbol_state
+            SET
+                globally_acked = 1,
+
+                last_executed_updated_utc = ?,
+                last_executed_action = ?,
+                last_executed_utc = ?,
+
+                cooldown_until_utc = ?,
+
+                pending_action = NULL,
+                pending_updated_utc = NULL,
+                pending_tv_id = NULL,
+                pending_tv_ts = NULL,
+                pending_payload_hash = NULL,
+                pending_created_utc = NULL,
+
+                claimed_by_account = NULL,
+                claimed_by_magic = NULL,
+                claim_until_utc = NULL,
+
+                updated_utc = ?
+            WHERE symbol = ?
+        """, (
+            upd,
+            pending_action,
+            now.isoformat(),
+            cooldown_until_utc,
+            now.isoformat(),
+            sym
+        ))
+        conn.commit()
+
+        log_signal(
+            conn,
+            sym,
+            pending_action,
+            pending_tv_id,
+            pending_tv_ts,
+            upd,
+            "acked_executed",
+            f"executed by account={acc} magic={mag}; cooldown started",
+            pending_hash
+        )
+
+        conn.close()
         return {
-            "status": "stale",
-            "symbol": symbol_n,
-            "expected_updated_utc": row["pending_updated_utc"],
-            "got_updated_utc": updated_n,
+            "status": "acked",
+            "symbol": sym,
+            "updated_utc": upd,
+            "cooldown_until_utc": cooldown_until_utc,
+            "cooldown_min": SYMBOL_COOLDOWN_MIN
         }
 
-    # ACK speichern
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO acks(symbol, account, magic, updated_utc, ack_utc)
-        VALUES(?,?,?,?,?)
-        """,
-        (symbol_n, account_n, magic_n, updated_n, now_utc_iso()),
-    )
-
-    # Pending als global ausgeführt markieren
-    cooldown_until = (now_utc_dt() + timedelta(minutes=get_cooldown_min(symbol_n))).isoformat()
-
-    update_state(cur, symbol_n, {
-        "globally_acked": 1,
-        "cooldown_until_utc": cooldown_until,
-
-        "last_executed_updated_utc": row["pending_updated_utc"],
-        "last_executed_action": row["pending_action"],
-        "last_executed_utc": now_utc_iso(),
-
-        "pending_action": None,
-        "pending_updated_utc": None,
-        "pending_tv_id": None,
-        "pending_tv_ts": None,
-        "pending_payload_hash": None,
-        "pending_created_utc": None,
-
-        "claimed_by_account": None,
-        "claimed_by_magic": None,
-        "claim_until_utc": None,
-    })
-
-    con.commit()
-    con.close()
-
-    return {
-        "status": "ack_ok",
-        "symbol": symbol_n,
-        "account": account_n,
-        "magic": magic_n,
-        "cooldown_until_utc": cooldown_until,
-    }
-
-
-# =========================================================
-# GATE
-# =========================================================
-
+# -------------------------------------------------------------------
+# GATE STUB / COMPAT
+# -------------------------------------------------------------------
 @app.get("/status/gate_combo")
-def gate_combo(symbol: str = Query(...)) -> Dict[str, Any]:
-    symbol_n = norm_symbol(symbol)
-    con = db_connect()
-    cur = con.cursor()
-
-    row = cur.execute("SELECT * FROM gates WHERE symbol=?", (symbol_n,)).fetchone()
-    con.close()
-
-    if not row:
-        return {
-            "symbol": symbol_n,
-            "combo_level": "GREEN",
-            "usd_level": "UNKNOWN",
-            "r_level": "UNKNOWN",
-            "updated_utc": "",
-        }
-
+def gate_combo(symbol: str) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    lvl = DEFAULT_GATE_LEVEL if DEFAULT_GATE_LEVEL in {"GREEN", "YELLOW", "RED"} else "GREEN"
     return {
-        "symbol": symbol_n,
-        "combo_level": row["combo_level"],
-        "usd_level": row["usd_level"],
-        "r_level": row["r_level"],
-        "updated_utc": row["updated_utc"],
+        "symbol": sym,
+        "combo_level": lvl,
+        "usd_level": lvl,
+        "r_level": lvl
     }
 
-@app.post("/status/gate_combo")
-def gate_combo_update(g: GateUpdate) -> Dict[str, Any]:
-    require_key(g.key)
-    symbol_n = norm_symbol(g.symbol)
-
-    con = db_connect()
-    cur = con.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO gates(symbol, combo_level, usd_level, r_level, updated_utc)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(symbol) DO UPDATE SET
-            combo_level=excluded.combo_level,
-            usd_level=excluded.usd_level,
-            r_level=excluded.r_level,
-            updated_utc=excluded.updated_utc
-        """,
-        (symbol_n, g.combo_level, g.usd_level, g.r_level, now_utc_iso()),
-    )
-
-    con.commit()
-    con.close()
-
-    return {
-        "ok": True,
-        "symbol": symbol_n,
-        "combo_level": g.combo_level,
-        "utc": now_utc_iso(),
-    }
-
-
-# =========================================================
-# RISK SNAPSHOT
-# =========================================================
-
+# -------------------------------------------------------------------
+# RISK CAPTURE / COMPAT
+# -------------------------------------------------------------------
 @app.post("/risk")
-def risk(snapshot: RiskSnapshot) -> Dict[str, Any]:
-    con = db_connect()
-    cur = con.cursor()
+def risk(event: RiskEvent) -> dict[str, Any]:
+    sym = norm_symbol(event.symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
 
-    cur.execute(
-        """
-        INSERT INTO risks(account, symbol, position_id, magic, open_time, entry_price, sl, lots, risk_usd, source, received_utc)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            str(snapshot.account),
-            norm_symbol(snapshot.symbol),
-            str(snapshot.position_id),
-            int(snapshot.magic),
-            str(snapshot.open_time),
-            float(snapshot.entry_price),
-            float(snapshot.sl),
-            float(snapshot.lots),
-            float(snapshot.risk_usd),
-            str(snapshot.source),
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO risk_events (
+                created_utc, account, symbol, position_id, magic, open_time,
+                entry_price, sl, lots, risk_usd, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             now_utc_iso(),
-        ),
-    )
+            event.account,
+            sym,
+            event.position_id,
+            event.magic,
+            event.open_time,
+            event.entry_price,
+            event.sl,
+            event.lots,
+            event.risk_usd,
+            event.source
+        ))
+        conn.commit()
+        conn.close()
 
-    con.commit()
-    con.close()
-    return {"ok": True}
+    return {"status": "ok"}
 
-
-# =========================================================
+# -------------------------------------------------------------------
 # DEBUG
-# =========================================================
-
+# -------------------------------------------------------------------
 @app.get("/debug/state")
-def debug_state(symbol: str = Query(...)) -> Dict[str, Any]:
-    symbol_n = norm_symbol(symbol)
-    con = db_connect()
-    cur = con.cursor()
-    row = get_state_row(cur, symbol_n)
-    con.commit()
-    con.close()
+def debug_state(symbol: str) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        row = expire_pending_if_needed(conn, sym)
+        data = dict(row)
+        conn.close()
 
     return {
-        "symbol": symbol_n,
-        "state": dict(row),
-        "server_time_utc": now_utc_iso(),
-    }
-
-
-# =========================================================
-# RESET
-# =========================================================
-
-@app.post("/reset")
-def reset(req: ResetReq) -> Dict[str, Any]:
-    require_key(req.key)
-    symbol_n = norm_symbol(req.symbol)
-
-    con = db_connect()
-    cur = con.cursor()
-    row = get_state_row(cur, symbol_n)
-
-    fields = {
-        "pending_action": None,
-        "pending_updated_utc": None,
-        "pending_tv_id": None,
-        "pending_tv_ts": None,
-        "pending_payload_hash": None,
-        "pending_created_utc": None,
-        "claimed_by_account": None,
-        "claimed_by_magic": None,
-        "claim_until_utc": None,
-        "globally_acked": 0,
-    }
-
-    if req.clear_cooldown:
-        fields["cooldown_until_utc"] = None
-
-    update_state(cur, symbol_n, fields)
-
-    if req.clear_acks:
-        cur.execute("DELETE FROM acks WHERE symbol=?", (symbol_n,))
-
-    con.commit()
-    con.close()
-
-    return {
-        "ok": True,
-        "symbol": symbol_n,
-        "clear_acks": req.clear_acks,
-        "clear_cooldown": req.clear_cooldown,
+        "symbol": sym,
+        "state": data,
+        "server_time_utc": now_utc_iso()
     }
