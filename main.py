@@ -1,4 +1,4 @@
-# app.py
+1# app.py
 # FastAPI Signal Agent API
 #
 # HARD RULES:
@@ -15,7 +15,6 @@
 #   GET  /latest?symbol=...&account=...&magic=...
 #   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
 #   GET  /status/gate_combo?symbol=...
-
 #   POST /risk
 #   GET  /debug/state?symbol=...
 #
