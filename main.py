@@ -18,25 +18,37 @@
 #   POST /risk
 #   GET  /debug/state?symbol=...
 #
+# LOGIN ENDPOINTS:
+#   POST /login
+#   GET  /me
+#
 # START:
 #   uvicorn app:app --host 0.0.0.0 --port 10000
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, status
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
+from jose import jwt, JWTError
 import hashlib
 import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="2.1.0")
+app = FastAPI(title="Signal Agent API", version="2.2.0")
 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
+
+# Login / JWT
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+APP_USERNAME = os.getenv("APP_USERNAME", "admin")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
 
 # hard rules
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
@@ -45,6 +57,7 @@ PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", "120"))  # prevents deadlock
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
 DB_LOCK = threading.Lock()
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # -------------------------------------------------------------------
 # MODELS
@@ -67,6 +80,17 @@ class RiskEvent(BaseModel):
     lots: Optional[float] = None
     risk_usd: Optional[float] = None
     source: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+
+class UserResponse(BaseModel):
+    username: str
 
 # -------------------------------------------------------------------
 # TIME / HELPERS
@@ -110,6 +134,34 @@ def norm_action(a: str) -> str:
 def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
     raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+# -------------------------------------------------------------------
+# LOGIN / JWT HELPERS
+# -------------------------------------------------------------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = now_utc_dt() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def authenticate_user(username: str, password: str) -> bool:
+    return username == APP_USERNAME and password == APP_PASSWORD
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> UserResponse:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Ungültiger oder abgelaufener Token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise credentials_exception
+        return UserResponse(username=username)
+    except JWTError:
+        raise credentials_exception
 
 # -------------------------------------------------------------------
 # DB
@@ -310,7 +362,33 @@ def root() -> dict[str, Any]:
         "cooldown_min": SYMBOL_COOLDOWN_MIN,
         "claim_ttl_sec": CLAIM_TTL_SEC,
         "pending_ttl_sec": PENDING_TTL_SEC,
+        "login_enabled": True
     }
+
+# -------------------------------------------------------------------
+# LOGIN
+# -------------------------------------------------------------------
+@app.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest) -> dict[str, str]:
+    if not authenticate_user(data.username, data.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Benutzername oder Passwort falsch"
+        )
+
+    access_token = create_access_token(
+        data={"sub": data.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+@app.get("/me", response_model=UserResponse)
+def me(current_user: UserResponse = Depends(get_current_user)) -> UserResponse:
+    return current_user
 
 # -------------------------------------------------------------------
 # TV INGEST
