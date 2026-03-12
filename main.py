@@ -1,25 +1,5 @@
 # app.py
 # FastAPI Signal Agent API
-#
-# HARD RULES:
-# - Exactly ONE executable signal per symbol at a time
-# - Exclusive claim: only one account/magic can receive a pending signal
-# - ACK starts a hard 30-minute cooldown per symbol
-# - During cooldown, ALL new TV signals for that symbol are ignored
-# - Repeated / re-sent / new-id signals are ignored while pending or cooling down
-# - Pending signals auto-expire if not ACKed in time (prevents deadlock)
-#
-# ENDPOINTS:
-#   GET  /
-#   POST /tv
-#   GET  /latest?symbol=...&account=...&magic=...
-#   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
-#   GET  /status/gate_combo?symbol=...
-#   POST /risk
-#   GET  /debug/state?symbol=...
-#
-# START:
-#   uvicorn app:app --host 0.0.0.0 --port 10000
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -30,13 +10,13 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="2.3.0")
+app = FastAPI(title="Signal Agent API", version="2.3.1")
 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
-DB_PATH = os.getenv("DB_PATH", "/var/data/signal_agent.db")
+DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 CLAIM_TTL_SEC = int(os.getenv("CLAIM_TTL_SEC", "20"))
@@ -93,11 +73,9 @@ def secs_left(future_dt: Optional[datetime]) -> int:
 def norm_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
 
-    # GOLD aliases -> XAUUSD
     if s in {"GOLD", "XAU", "XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"}:
         return "XAUUSD"
 
-    # BTC aliases -> BTCUSD
     if s in {"BTC", "BTCUSD", "BITCOIN", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"}:
         return "BTCUSD"
 
@@ -440,7 +418,7 @@ def tv(signal: TVSignal) -> dict[str, Any]:
         }
 
 # -------------------------------------------------------------------
-# LATEST (exclusive claim)
+# LATEST
 # -------------------------------------------------------------------
 @app.get("/latest")
 def latest(symbol: str,
