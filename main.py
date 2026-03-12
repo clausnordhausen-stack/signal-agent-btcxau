@@ -1,4 +1,4 @@
-1# app.py
+# app.py
 # FastAPI Signal Agent API
 #
 # HARD RULES:
@@ -18,46 +18,32 @@
 #   POST /risk
 #   GET  /debug/state?symbol=...
 #
-# LOGIN ENDPOINTS:
-#   POST /login
-#   GET  /me
-#
 # START:
 #   uvicorn app:app --host 0.0.0.0 --port 10000
 
-from fastapi import FastAPI, HTTPException, Query, Depends, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
-from jose import jwt, JWTError
 import hashlib
 import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="2.2.0")
+app = FastAPI(title="Signal Agent API", version="2.3.0")
 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
-DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
+DB_PATH = os.getenv("DB_PATH", "/var/data/signal_agent.db")
 
-# Login / JWT
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-APP_USERNAME = os.getenv("APP_USERNAME", "admin")
-APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
-
-# hard rules
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
 CLAIM_TTL_SEC = int(os.getenv("CLAIM_TTL_SEC", "20"))
-PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", "120"))  # prevents deadlock
+PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", "120"))
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
 DB_LOCK = threading.Lock()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # -------------------------------------------------------------------
 # MODELS
@@ -65,7 +51,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 class TVSignal(BaseModel):
     key: str
     symbol: str
-    action: str          # BUY / SELL
+    action: str
     ts: Optional[str] = None
     id: Optional[str] = None
 
@@ -80,17 +66,6 @@ class RiskEvent(BaseModel):
     lots: Optional[float] = None
     risk_usd: Optional[float] = None
     source: Optional[str] = None
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str
-
-class UserResponse(BaseModel):
-    username: str
 
 # -------------------------------------------------------------------
 # TIME / HELPERS
@@ -118,11 +93,11 @@ def secs_left(future_dt: Optional[datetime]) -> int:
 def norm_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
 
-    # gold aliases -> canonical XAUUSD
+    # GOLD aliases -> XAUUSD
     if s in {"GOLD", "XAU", "XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"}:
         return "XAUUSD"
 
-    # btc aliases -> canonical BTCUSD
+    # BTC aliases -> BTCUSD
     if s in {"BTC", "BTCUSD", "BITCOIN", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"}:
         return "BTCUSD"
 
@@ -134,34 +109,6 @@ def norm_action(a: str) -> str:
 def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
     raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-# -------------------------------------------------------------------
-# LOGIN / JWT HELPERS
-# -------------------------------------------------------------------
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = now_utc_dt() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def authenticate_user(username: str, password: str) -> bool:
-    return username == APP_USERNAME and password == APP_PASSWORD
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> UserResponse:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Ungültiger oder abgelaufener Token",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise credentials_exception
-        return UserResponse(username=username)
-    except JWTError:
-        raise credentials_exception
 
 # -------------------------------------------------------------------
 # DB
@@ -291,10 +238,7 @@ def log_signal(conn: sqlite3.Connection,
 
 def clear_pending(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
     row = get_state(conn, symbol)
-    if row is None:
-        return
-
-    if not row["pending_updated_utc"]:
+    if row is None or not row["pending_updated_utc"]:
         return
 
     log_signal(
@@ -357,38 +301,11 @@ def expire_pending_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.R
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
-        "status": "ok",
-        "service": "Signal Agent API",
+        "status": "Signal Agent API running",
         "cooldown_min": SYMBOL_COOLDOWN_MIN,
         "claim_ttl_sec": CLAIM_TTL_SEC,
         "pending_ttl_sec": PENDING_TTL_SEC,
-        "login_enabled": True
     }
-
-# -------------------------------------------------------------------
-# LOGIN
-# -------------------------------------------------------------------
-@app.post("/login", response_model=TokenResponse)
-def login(data: LoginRequest) -> dict[str, str]:
-    if not authenticate_user(data.username, data.password):
-        raise HTTPException(
-            status_code=401,
-            detail="Benutzername oder Passwort falsch"
-        )
-
-    access_token = create_access_token(
-        data={"sub": data.username},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-
-    return {
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
-
-@app.get("/me", response_model=UserResponse)
-def me(current_user: UserResponse = Depends(get_current_user)) -> UserResponse:
-    return current_user
 
 # -------------------------------------------------------------------
 # TV INGEST
@@ -416,7 +333,6 @@ def tv(signal: TVSignal) -> dict[str, Any]:
         now = now_utc_dt()
         cooldown_until = parse_iso(row["cooldown_until_utc"])
 
-        # hard cooldown: ignore absolutely everything during cooldown
         if cooldown_until and now < cooldown_until:
             left = secs_left(cooldown_until)
             log_signal(
@@ -433,7 +349,6 @@ def tv(signal: TVSignal) -> dict[str, Any]:
                 "cooldown_left_sec": left
             }
 
-        # if pending exists and is still valid, ignore all further TV events
         if row["pending_updated_utc"] and int(row["globally_acked"] or 0) == 0:
             age_sec = int((now - parse_iso(row["pending_created_utc"])).total_seconds()) if row["pending_created_utc"] else 0
             left = max(0, PENDING_TTL_SEC - age_sec)
@@ -452,7 +367,6 @@ def tv(signal: TVSignal) -> dict[str, Any]:
                 "pending_ttl_left_sec": left
             }
 
-        # duplicate exact payload guard
         if row["last_seen_payload_hash"] == phash:
             log_signal(
                 conn, symbol, action, tv_id, tv_ts, None,
@@ -547,7 +461,6 @@ def latest(symbol: str,
         cooldown_until = parse_iso(row["cooldown_until_utc"])
         claim_until = parse_iso(row["claim_until_utc"])
 
-        # if cooldown active: return null
         if cooldown_until and now < cooldown_until:
             left = secs_left(cooldown_until)
             conn.close()
@@ -558,7 +471,6 @@ def latest(symbol: str,
                 "cooldown_left_sec": left
             }
 
-        # if no pending signal: return null
         if not row["pending_updated_utc"] or int(row["globally_acked"] or 0) == 1:
             conn.close()
             return {
@@ -568,7 +480,6 @@ def latest(symbol: str,
                 "cooldown_left_sec": 0
             }
 
-        # another account/magic already holds a live claim
         if row["claimed_by_account"] and row["claimed_by_magic"] and claim_until and now < claim_until:
             if not (row["claimed_by_account"] == acc and row["claimed_by_magic"] == mag):
                 conn.close()
@@ -579,7 +490,6 @@ def latest(symbol: str,
                     "cooldown_left_sec": 0
                 }
 
-        # create / refresh claim for this requester
         claim_until_utc = (now + timedelta(seconds=CLAIM_TTL_SEC)).isoformat()
         cur = conn.cursor()
         cur.execute("""
@@ -617,7 +527,7 @@ def latest(symbol: str,
         }
 
 # -------------------------------------------------------------------
-# ACK (global execute lock + cooldown start)
+# ACK
 # -------------------------------------------------------------------
 @app.post("/ack")
 def ack(symbol: str,
@@ -637,7 +547,6 @@ def ack(symbol: str,
         row = expire_pending_if_needed(conn, sym)
         now = now_utc_dt()
 
-        # duplicate ACK to already executed signal
         if row["last_executed_updated_utc"] == upd:
             cooldown_until = parse_iso(row["cooldown_until_utc"])
             left = secs_left(cooldown_until)
@@ -649,7 +558,6 @@ def ack(symbol: str,
                 "cooldown_left_sec": left
             }
 
-        # must match current pending signal
         if row["pending_updated_utc"] != upd:
             conn.close()
             return {
@@ -658,7 +566,6 @@ def ack(symbol: str,
                 "updated_utc": upd
             }
 
-        # only current claimer may ACK
         if row["claimed_by_account"] and row["claimed_by_magic"]:
             if row["claimed_by_account"] != acc or row["claimed_by_magic"] != mag:
                 conn.close()
@@ -732,7 +639,7 @@ def ack(symbol: str,
         }
 
 # -------------------------------------------------------------------
-# GATE STUB / COMPAT
+# GATE COMPAT
 # -------------------------------------------------------------------
 @app.get("/status/gate_combo")
 def gate_combo(symbol: str) -> dict[str, Any]:
@@ -746,7 +653,7 @@ def gate_combo(symbol: str) -> dict[str, Any]:
     }
 
 # -------------------------------------------------------------------
-# RISK CAPTURE / COMPAT
+# RISK COMPAT
 # -------------------------------------------------------------------
 @app.post("/risk")
 def risk(event: RiskEvent) -> dict[str, Any]:
