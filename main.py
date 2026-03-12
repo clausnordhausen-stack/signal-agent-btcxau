@@ -1,5 +1,26 @@
 # app.py
-# FastAPI Signal Agent API
+# FastAPI Signal Agent API - MULTI-ACCOUNT BROADCAST
+#
+# RULES:
+# - One TradingView signal per symbol becomes one active broadcast signal
+# - Every account+magic can receive that signal exactly once
+# - Every account+magic can ACK that signal exactly once
+# - No account can receive the same signal twice
+# - Global 30-minute cooldown per symbol after signal acceptance
+# - During cooldown, all new TV signals for that symbol are ignored
+# - Active signal expires automatically after TTL
+#
+# ENDPOINTS:
+#   GET  /
+#   POST /tv
+#   GET  /latest?symbol=...&account=...&magic=...
+#   POST /ack?symbol=...&updated_utc=...&account=...&magic=...
+#   GET  /status/gate_combo?symbol=...
+#   POST /risk
+#   GET  /debug/state?symbol=...
+#
+# START:
+#   uvicorn app:app --host 0.0.0.0 --port 10000
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -10,7 +31,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="2.3.1")
+app = FastAPI(title="Signal Agent API", version="3.0.0")
 
 # -------------------------------------------------------------------
 # CONFIG
@@ -19,8 +40,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "claus-2026-xau-01!")
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 
 SYMBOL_COOLDOWN_MIN = int(os.getenv("SYMBOL_COOLDOWN_MIN", "30"))
-CLAIM_TTL_SEC = int(os.getenv("CLAIM_TTL_SEC", "20"))
-PENDING_TTL_SEC = int(os.getenv("PENDING_TTL_SEC", "120"))
+SIGNAL_TTL_SEC = int(os.getenv("SIGNAL_TTL_SEC", "1800"))   # active signal lifetime
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 
 DB_LOCK = threading.Lock()
@@ -48,7 +68,7 @@ class RiskEvent(BaseModel):
     source: Optional[str] = None
 
 # -------------------------------------------------------------------
-# TIME / HELPERS
+# HELPERS
 # -------------------------------------------------------------------
 def now_utc_dt() -> datetime:
     return datetime.now(timezone.utc)
@@ -67,8 +87,7 @@ def parse_iso(s: Optional[str]) -> Optional[datetime]:
 def secs_left(future_dt: Optional[datetime]) -> int:
     if future_dt is None:
         return 0
-    left = int((future_dt - now_utc_dt()).total_seconds())
-    return max(0, left)
+    return max(0, int((future_dt - now_utc_dt()).total_seconds()))
 
 def norm_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
@@ -83,6 +102,9 @@ def norm_symbol(raw: str) -> str:
 
 def norm_action(a: str) -> str:
     return (a or "").strip().upper()
+
+def acct_key(account: Optional[str], magic: Optional[str]) -> str:
+    return f"{(account or '').strip()}|{(magic or '').strip()}"
 
 def payload_hash(symbol: str, action: str, tv_id: str, tv_ts: str) -> str:
     raw = f"{symbol}|{action}|{tv_id}|{tv_ts}"
@@ -105,24 +127,14 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS symbol_state (
             symbol TEXT PRIMARY KEY,
 
-            pending_action TEXT,
-            pending_updated_utc TEXT,
-            pending_tv_id TEXT,
-            pending_tv_ts TEXT,
-            pending_payload_hash TEXT,
-            pending_created_utc TEXT,
-
-            claimed_by_account TEXT,
-            claimed_by_magic TEXT,
-            claim_until_utc TEXT,
-
-            globally_acked INTEGER NOT NULL DEFAULT 0,
+            active_updated_utc TEXT,
+            active_action TEXT,
+            active_tv_id TEXT,
+            active_tv_ts TEXT,
+            active_payload_hash TEXT,
+            active_created_utc TEXT,
 
             cooldown_until_utc TEXT,
-
-            last_executed_updated_utc TEXT,
-            last_executed_action TEXT,
-            last_executed_utc TEXT,
 
             last_seen_tv_id TEXT,
             last_seen_tv_ts TEXT,
@@ -130,6 +142,21 @@ def init_db() -> None:
             last_seen_payload_hash TEXT,
 
             updated_utc TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_delivery (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            account TEXT,
+            magic TEXT,
+            delivered INTEGER NOT NULL DEFAULT 0,
+            delivered_utc TEXT,
+            acked INTEGER NOT NULL DEFAULT 0,
+            acked_utc TEXT,
+            UNIQUE(symbol, updated_utc, account, magic)
         )
         """)
 
@@ -184,11 +211,8 @@ def upsert_empty_state(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
 
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO symbol_state (
-            symbol,
-            globally_acked,
-            updated_utc
-        ) VALUES (?, 0, ?)
+        INSERT INTO symbol_state (symbol, updated_utc)
+        VALUES (?, ?)
     """, (symbol, now_utc_iso()))
     conn.commit()
     return get_state(conn, symbol)
@@ -214,64 +238,70 @@ def log_signal(conn: sqlite3.Connection,
     ))
     conn.commit()
 
-def clear_pending(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
+def clear_active_signal(conn: sqlite3.Connection, symbol: str, reason: str) -> None:
     row = get_state(conn, symbol)
-    if row is None or not row["pending_updated_utc"]:
+    if row is None or not row["active_updated_utc"]:
         return
 
     log_signal(
-        conn=conn,
-        symbol=symbol,
-        action=row["pending_action"],
-        tv_id=row["pending_tv_id"],
-        tv_ts=row["pending_tv_ts"],
-        updated_utc=row["pending_updated_utc"],
-        status="expired_pending",
-        note=reason,
-        phash=row["pending_payload_hash"],
+        conn,
+        symbol,
+        row["active_action"],
+        row["active_tv_id"],
+        row["active_tv_ts"],
+        row["active_updated_utc"],
+        "signal_cleared",
+        reason,
+        row["active_payload_hash"]
     )
 
     cur = conn.cursor()
     cur.execute("""
         UPDATE symbol_state
         SET
-            pending_action = NULL,
-            pending_updated_utc = NULL,
-            pending_tv_id = NULL,
-            pending_tv_ts = NULL,
-            pending_payload_hash = NULL,
-            pending_created_utc = NULL,
-
-            claimed_by_account = NULL,
-            claimed_by_magic = NULL,
-            claim_until_utc = NULL,
-
-            globally_acked = 0,
+            active_updated_utc = NULL,
+            active_action = NULL,
+            active_tv_id = NULL,
+            active_tv_ts = NULL,
+            active_payload_hash = NULL,
+            active_created_utc = NULL,
             updated_utc = ?
         WHERE symbol = ?
     """, (now_utc_iso(), symbol))
     conn.commit()
 
-def expire_pending_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
+def expire_active_signal_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.Row:
     row = upsert_empty_state(conn, symbol)
 
-    if not row["pending_updated_utc"]:
+    if not row["active_updated_utc"]:
         return row
 
-    if int(row["globally_acked"] or 0) == 1:
-        return row
-
-    pending_created = parse_iso(row["pending_created_utc"])
-    if pending_created is None:
-        clear_pending(conn, symbol, "pending had no valid created timestamp")
+    created = parse_iso(row["active_created_utc"])
+    if created is None:
+        clear_active_signal(conn, symbol, "active signal had invalid timestamp")
         return get_state(conn, symbol)
 
-    age_sec = int((now_utc_dt() - pending_created).total_seconds())
-    if age_sec >= PENDING_TTL_SEC:
-        clear_pending(conn, symbol, f"pending expired after {age_sec}s without ACK")
+    age = int((now_utc_dt() - created).total_seconds())
+    if age >= SIGNAL_TTL_SEC:
+        clear_active_signal(conn, symbol, f"active signal expired after {age}s")
         return get_state(conn, symbol)
 
     return row
+
+def ensure_delivery_row(conn: sqlite3.Connection, symbol: str, updated_utc: str, account: str, magic: str) -> sqlite3.Row:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO signal_delivery (
+            symbol, updated_utc, account, magic, delivered, acked
+        ) VALUES (?, ?, ?, ?, 0, 0)
+    """, (symbol, updated_utc, account, magic))
+    conn.commit()
+
+    cur.execute("""
+        SELECT * FROM signal_delivery
+        WHERE symbol = ? AND updated_utc = ? AND account = ? AND magic = ?
+    """, (symbol, updated_utc, account, magic))
+    return cur.fetchone()
 
 # -------------------------------------------------------------------
 # ROOT
@@ -280,9 +310,9 @@ def expire_pending_if_needed(conn: sqlite3.Connection, symbol: str) -> sqlite3.R
 def root() -> dict[str, Any]:
     return {
         "status": "Signal Agent API running",
+        "mode": "multi_account_broadcast",
         "cooldown_min": SYMBOL_COOLDOWN_MIN,
-        "claim_ttl_sec": CLAIM_TTL_SEC,
-        "pending_ttl_sec": PENDING_TTL_SEC,
+        "signal_ttl_sec": SIGNAL_TTL_SEC
     }
 
 # -------------------------------------------------------------------
@@ -306,57 +336,41 @@ def tv(signal: TVSignal) -> dict[str, Any]:
 
     with DB_LOCK:
         conn = get_conn()
-        row = expire_pending_if_needed(conn, symbol)
-
+        row = expire_active_signal_if_needed(conn, symbol)
         now = now_utc_dt()
-        cooldown_until = parse_iso(row["cooldown_until_utc"])
 
+        cooldown_until = parse_iso(row["cooldown_until_utc"])
         if cooldown_until and now < cooldown_until:
             left = secs_left(cooldown_until)
-            log_signal(
-                conn, symbol, action, tv_id, tv_ts, None,
-                "ignored_cooldown",
-                f"cooldown active, {left}s left",
-                phash
-            )
+            log_signal(conn, symbol, action, tv_id, tv_ts, None,
+                       "ignored_cooldown", f"cooldown active, {left}s left", phash)
             conn.close()
             return {
                 "status": "ignored_cooldown",
                 "symbol": symbol,
-                "action": action,
                 "cooldown_left_sec": left
             }
 
-        if row["pending_updated_utc"] and int(row["globally_acked"] or 0) == 0:
-            age_sec = int((now - parse_iso(row["pending_created_utc"])).total_seconds()) if row["pending_created_utc"] else 0
-            left = max(0, PENDING_TTL_SEC - age_sec)
-
-            log_signal(
-                conn, symbol, action, tv_id, tv_ts, row["pending_updated_utc"],
-                "ignored_pending_exists",
-                f"another signal is still pending, ttl_left={left}s",
-                phash
-            )
+        # if one active signal already exists, ignore all new ones until it expires
+        if row["active_updated_utc"]:
+            created = parse_iso(row["active_created_utc"])
+            ttl_left = max(0, SIGNAL_TTL_SEC - int((now - created).total_seconds())) if created else 0
+            log_signal(conn, symbol, action, tv_id, tv_ts, row["active_updated_utc"],
+                       "ignored_active_exists", f"signal already active, ttl_left={ttl_left}s", phash)
             conn.close()
             return {
-                "status": "ignored_pending_exists",
+                "status": "ignored_active_exists",
                 "symbol": symbol,
-                "pending_updated_utc": row["pending_updated_utc"],
-                "pending_ttl_left_sec": left
+                "active_updated_utc": row["active_updated_utc"],
+                "signal_ttl_left_sec": ttl_left
             }
 
+        # exact duplicate payload guard
         if row["last_seen_payload_hash"] == phash:
-            log_signal(
-                conn, symbol, action, tv_id, tv_ts, None,
-                "ignored_duplicate_payload",
-                "same payload hash already seen",
-                phash
-            )
+            log_signal(conn, symbol, action, tv_id, tv_ts, None,
+                       "ignored_duplicate_payload", "same payload hash already seen", phash)
             conn.close()
-            return {
-                "status": "ignored_duplicate_payload",
-                "symbol": symbol
-            }
+            return {"status": "ignored_duplicate_payload", "symbol": symbol}
 
         updated_utc = now_utc_iso()
 
@@ -364,18 +378,14 @@ def tv(signal: TVSignal) -> dict[str, Any]:
         cur.execute("""
             UPDATE symbol_state
             SET
-                pending_action = ?,
-                pending_updated_utc = ?,
-                pending_tv_id = ?,
-                pending_tv_ts = ?,
-                pending_payload_hash = ?,
-                pending_created_utc = ?,
+                active_updated_utc = ?,
+                active_action = ?,
+                active_tv_id = ?,
+                active_tv_ts = ?,
+                active_payload_hash = ?,
+                active_created_utc = ?,
 
-                claimed_by_account = NULL,
-                claimed_by_magic = NULL,
-                claim_until_utc = NULL,
-
-                globally_acked = 0,
+                cooldown_until_utc = ?,
 
                 last_seen_tv_id = ?,
                 last_seen_tv_ts = ?,
@@ -385,40 +395,36 @@ def tv(signal: TVSignal) -> dict[str, Any]:
                 updated_utc = ?
             WHERE symbol = ?
         """, (
-            action,
             updated_utc,
+            action,
             tv_id or None,
             tv_ts or None,
             phash,
             updated_utc,
-
+            (now + timedelta(minutes=SYMBOL_COOLDOWN_MIN)).isoformat(),
             tv_id or None,
             tv_ts or None,
             action,
             phash,
-
             updated_utc,
             symbol
         ))
         conn.commit()
 
-        log_signal(
-            conn, symbol, action, tv_id, tv_ts, updated_utc,
-            "accepted",
-            "signal accepted as exclusive pending signal",
-            phash
-        )
+        log_signal(conn, symbol, action, tv_id, tv_ts, updated_utc,
+                   "accepted_broadcast", "broadcast signal accepted", phash)
 
         conn.close()
         return {
             "status": "accepted",
             "symbol": symbol,
             "action": action,
-            "updated_utc": updated_utc
+            "updated_utc": updated_utc,
+            "cooldown_min": SYMBOL_COOLDOWN_MIN
         }
 
 # -------------------------------------------------------------------
-# LATEST
+# LATEST - every account gets the signal once
 # -------------------------------------------------------------------
 @app.get("/latest")
 def latest(symbol: str,
@@ -430,26 +436,30 @@ def latest(symbol: str,
 
     if not sym:
         raise HTTPException(status_code=400, detail="symbol required")
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
 
     with DB_LOCK:
         conn = get_conn()
-        row = expire_pending_if_needed(conn, sym)
+        row = expire_active_signal_if_needed(conn, sym)
 
-        now = now_utc_dt()
-        cooldown_until = parse_iso(row["cooldown_until_utc"])
-        claim_until = parse_iso(row["claim_until_utc"])
-
-        if cooldown_until and now < cooldown_until:
-            left = secs_left(cooldown_until)
+        if not row["active_updated_utc"]:
+            cooldown_until = parse_iso(row["cooldown_until_utc"])
             conn.close()
             return {
                 "symbol": sym,
                 "signal": None,
                 "updated_utc": "",
-                "cooldown_left_sec": left
+                "cooldown_left_sec": secs_left(cooldown_until)
             }
 
-        if not row["pending_updated_utc"] or int(row["globally_acked"] or 0) == 1:
+        updated_utc = row["active_updated_utc"]
+        delivery = ensure_delivery_row(conn, sym, updated_utc, acc, mag)
+
+        # already acked -> never deliver again
+        if int(delivery["acked"]) == 1:
             conn.close()
             return {
                 "symbol": sym,
@@ -458,37 +468,16 @@ def latest(symbol: str,
                 "cooldown_left_sec": 0
             }
 
-        if row["claimed_by_account"] and row["claimed_by_magic"] and claim_until and now < claim_until:
-            if not (row["claimed_by_account"] == acc and row["claimed_by_magic"] == mag):
-                conn.close()
-                return {
-                    "symbol": sym,
-                    "signal": None,
-                    "updated_utc": "",
-                    "cooldown_left_sec": 0
-                }
-
-        claim_until_utc = (now + timedelta(seconds=CLAIM_TTL_SEC)).isoformat()
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE symbol_state
-            SET
-                claimed_by_account = ?,
-                claimed_by_magic = ?,
-                claim_until_utc = ?,
-                updated_utc = ?
-            WHERE symbol = ?
-        """, (
-            acc or None,
-            mag or None,
-            claim_until_utc,
-            now.isoformat(),
-            sym
-        ))
-        conn.commit()
-
-        action = row["pending_action"]
-        updated_utc = row["pending_updated_utc"]
+        # already delivered but not acked -> return same signal again
+        # this helps if EA fetched but order/ack got delayed
+        if int(delivery["delivered"]) == 0:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE signal_delivery
+                SET delivered = 1, delivered_utc = ?
+                WHERE id = ?
+            """, (now_utc_iso(), delivery["id"]))
+            conn.commit()
 
         conn.close()
         return {
@@ -496,16 +485,15 @@ def latest(symbol: str,
             "updated_utc": updated_utc,
             "signal": {
                 "symbol": sym,
-                "action": action
+                "action": row["active_action"]
             },
-            "claimed_by_account": acc,
-            "claimed_by_magic": mag,
-            "claim_ttl_sec": CLAIM_TTL_SEC,
+            "account": acc,
+            "magic": mag,
             "cooldown_left_sec": 0
         }
 
 # -------------------------------------------------------------------
-# ACK
+# ACK - each account ACKs once
 # -------------------------------------------------------------------
 @app.post("/ack")
 def ack(symbol: str,
@@ -513,107 +501,57 @@ def ack(symbol: str,
         account: Optional[str] = Query(default=None),
         magic: Optional[str] = Query(default=None)) -> dict[str, Any]:
     sym = norm_symbol(symbol)
+    upd = (updated_utc or "").strip()
     acc = (account or "").strip()
     mag = (magic or "").strip()
-    upd = (updated_utc or "").strip()
 
-    if not sym or not upd:
-        raise HTTPException(status_code=400, detail="symbol and updated_utc required")
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol required")
+    if not upd:
+        raise HTTPException(status_code=400, detail="updated_utc required")
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
 
     with DB_LOCK:
         conn = get_conn()
-        row = expire_pending_if_needed(conn, sym)
-        now = now_utc_dt()
+        row = expire_active_signal_if_needed(conn, sym)
 
-        if row["last_executed_updated_utc"] == upd:
-            cooldown_until = parse_iso(row["cooldown_until_utc"])
-            left = secs_left(cooldown_until)
+        # if signal already expired/cleared
+        if not row["active_updated_utc"]:
             conn.close()
-            return {
-                "status": "already_acked",
-                "symbol": sym,
-                "updated_utc": upd,
-                "cooldown_left_sec": left
-            }
+            return {"status": "no_active_signal", "symbol": sym, "updated_utc": upd}
 
-        if row["pending_updated_utc"] != upd:
+        if row["active_updated_utc"] != upd:
             conn.close()
-            return {
-                "status": "ignored_unknown_updated_utc",
-                "symbol": sym,
-                "updated_utc": upd
-            }
+            return {"status": "ignored_unknown_updated_utc", "symbol": sym, "updated_utc": upd}
 
-        if row["claimed_by_account"] and row["claimed_by_magic"]:
-            if row["claimed_by_account"] != acc or row["claimed_by_magic"] != mag:
-                conn.close()
-                return {
-                    "status": "ignored_not_claimer",
-                    "symbol": sym,
-                    "updated_utc": upd
-                }
+        delivery = ensure_delivery_row(conn, sym, upd, acc, mag)
 
-        pending_action = row["pending_action"]
-        pending_tv_id = row["pending_tv_id"]
-        pending_tv_ts = row["pending_tv_ts"]
-        pending_hash = row["pending_payload_hash"]
-
-        cooldown_until_utc = (now + timedelta(minutes=SYMBOL_COOLDOWN_MIN)).isoformat()
+        if int(delivery["acked"]) == 1:
+            conn.close()
+            return {"status": "already_acked", "symbol": sym, "updated_utc": upd}
 
         cur = conn.cursor()
         cur.execute("""
-            UPDATE symbol_state
+            UPDATE signal_delivery
             SET
-                globally_acked = 1,
-
-                last_executed_updated_utc = ?,
-                last_executed_action = ?,
-                last_executed_utc = ?,
-
-                cooldown_until_utc = ?,
-
-                pending_action = NULL,
-                pending_updated_utc = NULL,
-                pending_tv_id = NULL,
-                pending_tv_ts = NULL,
-                pending_payload_hash = NULL,
-                pending_created_utc = NULL,
-
-                claimed_by_account = NULL,
-                claimed_by_magic = NULL,
-                claim_until_utc = NULL,
-
-                updated_utc = ?
-            WHERE symbol = ?
-        """, (
-            upd,
-            pending_action,
-            now.isoformat(),
-            cooldown_until_utc,
-            now.isoformat(),
-            sym
-        ))
+                delivered = 1,
+                delivered_utc = COALESCE(delivered_utc, ?),
+                acked = 1,
+                acked_utc = ?
+            WHERE id = ?
+        """, (now_utc_iso(), now_utc_iso(), delivery["id"]))
         conn.commit()
-
-        log_signal(
-            conn,
-            sym,
-            pending_action,
-            pending_tv_id,
-            pending_tv_ts,
-            upd,
-            "acked_executed",
-            f"executed by account={acc} magic={mag}; cooldown started",
-            pending_hash
-        )
 
         conn.close()
         return {
             "status": "acked",
             "symbol": sym,
             "updated_utc": upd,
-            "cooldown_until_utc": cooldown_until_utc,
-            "cooldown_min": SYMBOL_COOLDOWN_MIN
+            "account": acc,
+            "magic": mag
         }
 
 # -------------------------------------------------------------------
@@ -676,12 +614,25 @@ def debug_state(symbol: str) -> dict[str, Any]:
 
     with DB_LOCK:
         conn = get_conn()
-        row = expire_pending_if_needed(conn, sym)
+        row = expire_active_signal_if_needed(conn, sym)
+
+        deliveries = []
+        if row["active_updated_utc"]:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT account, magic, delivered, delivered_utc, acked, acked_utc
+                FROM signal_delivery
+                WHERE symbol = ? AND updated_utc = ?
+                ORDER BY account, magic
+            """, (sym, row["active_updated_utc"]))
+            deliveries = [dict(r) for r in cur.fetchall()]
+
         data = dict(row)
         conn.close()
 
     return {
         "symbol": sym,
         "state": data,
+        "deliveries": deliveries,
         "server_time_utc": now_utc_iso()
     }
