@@ -1,15 +1,11 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
 
 app = FastAPI()
 
-# -----------------------------
-# CORS (für Flutter Web)
-# -----------------------------
-
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,85 +18,50 @@ app.add_middleware(
 # Models
 # -----------------------------
 
-class LoginRequest(BaseModel):
-    email: str
-    password: str
-
-
 class Signal(BaseModel):
     symbol: str
     side: str
     price: float
-    timeframe: Optional[str] = None
-    timestamp: Optional[str] = None
+    timestamp: str | None = None
 
 
 # -----------------------------
-# Root Endpoint
+# Root endpoint
 # -----------------------------
 
 @app.get("/")
 def root():
     return {
-        "service": "signal-agent-api",
         "status": "running",
-        "time": datetime.utcnow().isoformat()
+        "service": "signal-agent-api",
+        "timestamp": datetime.utcnow()
     }
 
 
 # -----------------------------
-# Health Check
+# Health check
 # -----------------------------
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "timestamp": datetime.utcnow().isoformat()
+        "time": datetime.utcnow()
     }
 
 
 # -----------------------------
-# Login Endpoint (Flutter)
-# -----------------------------
-
-@app.post("/login")
-async def login(data: LoginRequest):
-
-    email = data.email.strip()
-    password = data.password.strip()
-
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password required")
-
-    # Demo Login
-    if email == "test@test.com" and password == "123456":
-
-        return {
-            "success": True,
-            "token": "demo_token_123",
-            "user": {
-                "id": "1",
-                "email": email
-            }
-        }
-
-    raise HTTPException(status_code=401, detail="Invalid credentials")
-
-
-# -----------------------------
-# Trading Signal Endpoint
+# Receive trading signals
 # -----------------------------
 
 @app.post("/signal")
 async def receive_signal(signal: Signal):
 
     print("----- SIGNAL RECEIVED -----")
-    print("Symbol:", signal.symbol)
-    print("Side:", signal.side)
-    print("Price:", signal.price)
-    print("Timeframe:", signal.timeframe)
-    print("Timestamp:", signal.timestamp)
+    print(f"Symbol: {signal.symbol}")
+    print(f"Side: {signal.side}")
+    print(f"Price: {signal.price}")
+    print(f"Time: {signal.timestamp}")
 
     return {
         "status": "received",
@@ -111,11 +72,10 @@ async def receive_signal(signal: Signal):
 
 
 # -----------------------------
-# TradingView Webhook
+# Generic webhook endpoint
 # -----------------------------
 
 @app.post("/webhook")
-@app.post("/webhook/")
 async def webhook(request: Request):
 
     data = await request.json()
@@ -125,6 +85,5 @@ async def webhook(request: Request):
 
     return {
         "status": "ok",
-        "received": data,
-        "timestamp": datetime.utcnow().isoformat()
+        "data": data
     }
