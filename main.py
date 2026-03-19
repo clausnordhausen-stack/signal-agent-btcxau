@@ -9,7 +9,7 @@ import os
 import sqlite3
 import threading
 
-app = FastAPI(title="Signal Agent API", version="3.6.0")
+app = FastAPI(title="Signal Agent API", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,6 +78,13 @@ class ControlRiskFactorRequest(BaseModel):
     risk_factor: float
     note: Optional[str] = None
 
+class TVSignal(BaseModel):
+    key: str
+    symbol: str
+    action: str
+    id: Optional[str] = None
+    ts: Optional[str] = None
+
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
@@ -97,11 +104,39 @@ def parse_iso(s: Optional[str]) -> Optional[datetime]:
 
 def norm_symbol(raw: str) -> str:
     s = (raw or "").strip().upper()
-    if s in {"GOLD", "XAU", "XAUUSD", "OANDA:XAUUSD", "FOREXCOM:XAUUSD"}:
+
+    if s in {
+        "GOLD",
+        "XAU",
+        "XAUUSD",
+        "OANDA:XAUUSD",
+        "FOREXCOM:XAUUSD",
+        "CAPITALCOM:GOLD",
+    }:
         return "XAUUSD"
-    if s in {"BTC", "BTCUSD", "BITCOIN", "COINBASE:BTCUSD", "BINANCE:BTCUSDT"}:
+
+    if s in {
+        "BTC",
+        "BTCUSD",
+        "BITCOIN",
+        "COINBASE:BTCUSD",
+        "BINANCE:BTCUSDT",
+        "INDEX:BTCUSD",
+    }:
         return "BTCUSD"
+
     return s
+
+def norm_action(raw: str) -> str:
+    a = (raw or "").strip().upper()
+
+    if a in {"BUY", "LONG"}:
+        return "BUY"
+
+    if a in {"SELL", "SHORT"}:
+        return "SELL"
+
+    return ""
 
 def heartbeat_age_sec(last_seen_utc: Optional[str]) -> Optional[int]:
     dt = parse_iso(last_seen_utc)
@@ -118,6 +153,9 @@ def is_heartbeat_connected(last_seen_utc: Optional[str]) -> bool:
 def control_scope_key(symbol: Optional[str]) -> str:
     sym = norm_symbol(symbol or "")
     return "GLOBAL" if not sym else sym
+
+def delivery_key(account: Optional[str], magic: Optional[str]) -> tuple[str, str]:
+    return ((account or "").strip(), (magic or "").strip())
 
 # -------------------------------------------------------------------
 # LOGIN / JWT
@@ -228,6 +266,36 @@ def init_db() -> None:
         )
         """)
 
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_state (
+            symbol TEXT PRIMARY KEY,
+            signal_id TEXT,
+            action TEXT,
+            source_ts TEXT,
+            updated_utc TEXT NOT NULL,
+            raw_symbol TEXT,
+            raw_action TEXT,
+            note TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            account TEXT NOT NULL,
+            magic TEXT NOT NULL,
+            acked_utc TEXT NOT NULL,
+            UNIQUE(symbol, updated_utc, account, magic)
+        )
+        """)
+
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signal_deliveries_lookup
+        ON signal_deliveries(symbol, updated_utc, account, magic)
+        """)
+
         conn.commit()
 
         ensure_control_row(conn, "GLOBAL")
@@ -295,7 +363,7 @@ def get_control_state_payload(conn: sqlite3.Connection, symbol: Optional[str]) -
 def root() -> dict[str, Any]:
     return {
         "status": "Signal Agent API running",
-        "mode": "dashboard_backend",
+        "mode": "dashboard_backend_plus_signal_agent",
         "login_enabled": True,
         "heartbeat_timeout_sec": HEARTBEAT_TIMEOUT_SEC
     }
@@ -323,6 +391,213 @@ def me(current_user: UserResponse = Depends(get_current_user)) -> UserResponse:
     return current_user
 
 # -------------------------------------------------------------------
+# SIGNAL AGENT: TV
+# -------------------------------------------------------------------
+@app.post("/tv")
+def tv(signal: TVSignal) -> dict[str, Any]:
+    if signal.key != SECRET_KEY:
+        raise HTTPException(status_code=401, detail="invalid key")
+
+    sym = norm_symbol(signal.symbol)
+    action = norm_action(signal.action)
+
+    if not sym:
+        raise HTTPException(status_code=400, detail="invalid symbol")
+
+    if not action:
+        raise HTTPException(status_code=400, detail="invalid action")
+
+    updated_utc = now_utc_iso()
+    signal_id = (signal.id or "").strip()
+    if not signal_id:
+        signal_id = f"{sym}{action}{updated_utc}"
+
+    source_ts = (signal.ts or "").strip()
+    note = f"tv id={signal_id} ts={source_ts} raw_symbol={signal.symbol} raw_action={signal.action}"
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO signal_state (
+                symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                signal_id   = excluded.signal_id,
+                action      = excluded.action,
+                source_ts   = excluded.source_ts,
+                updated_utc = excluded.updated_utc,
+                raw_symbol  = excluded.raw_symbol,
+                raw_action  = excluded.raw_action,
+                note        = excluded.note
+        """, (
+            sym,
+            signal_id,
+            action,
+            source_ts,
+            updated_utc,
+            signal.symbol,
+            signal.action,
+            note,
+        ))
+
+        cur.execute("""
+            INSERT INTO debug_state (symbol, active_action, updated_utc, note)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                active_action = excluded.active_action,
+                updated_utc   = excluded.updated_utc,
+                note          = excluded.note
+        """, (sym, action, updated_utc, note))
+
+        conn.commit()
+        conn.close()
+
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "action": action,
+        "id": signal_id,
+        "updated_utc": updated_utc,
+    }
+
+# optional compatibility alias
+@app.post("/webhook")
+def webhook_alias(signal: TVSignal) -> dict[str, Any]:
+    return tv(signal)
+
+# -------------------------------------------------------------------
+# SIGNAL AGENT: LATEST
+# -------------------------------------------------------------------
+@app.get("/latest")
+def latest(
+    symbol: str,
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    acc, mag = delivery_key(account, magic)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
+            FROM signal_state
+            WHERE symbol = ?
+        """, (sym,))
+        row = cur.fetchone()
+
+        if row is None or not row["action"] or not row["updated_utc"]:
+            conn.close()
+            return {"signal": None}
+
+        if acc and mag:
+            cur.execute("""
+                SELECT 1
+                FROM signal_deliveries
+                WHERE symbol = ? AND updated_utc = ? AND account = ? AND magic = ?
+                LIMIT 1
+            """, (sym, row["updated_utc"], acc, mag))
+            ack_row = cur.fetchone()
+            if ack_row is not None:
+                conn.close()
+                return {"signal": None}
+
+        conn.close()
+
+    return {
+        "signal": {
+            "symbol": row["symbol"],
+            "action": row["action"],
+            "id": row["signal_id"],
+            "ts": row["source_ts"],
+        },
+        "updated_utc": row["updated_utc"],
+        "note": row["note"],
+        "account": account,
+        "magic": magic,
+    }
+
+# -------------------------------------------------------------------
+# SIGNAL AGENT: ACK
+# -------------------------------------------------------------------
+@app.post("/ack")
+def ack(
+    symbol: str,
+    updated_utc: str,
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    acc, mag = delivery_key(account, magic)
+
+    if not acc:
+        raise HTTPException(status_code=400, detail="account required")
+    if not mag:
+        raise HTTPException(status_code=400, detail="magic required")
+    if not updated_utc:
+        raise HTTPException(status_code=400, detail="updated_utc required")
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT symbol, updated_utc
+            FROM signal_state
+            WHERE symbol = ?
+        """, (sym,))
+        row = cur.fetchone()
+
+        if row is None:
+            conn.close()
+            return {
+                "status": "ok",
+                "acknowledged": False,
+                "reason": "no signal for symbol",
+                "symbol": sym,
+            }
+
+        # Allow ACK only for current active signal timestamp
+        if row["updated_utc"] != updated_utc:
+            conn.close()
+            return {
+                "status": "ok",
+                "acknowledged": False,
+                "reason": "updated_utc mismatch",
+                "symbol": sym,
+                "server_updated_utc": row["updated_utc"],
+            }
+
+        cur.execute("""
+            INSERT OR IGNORE INTO signal_deliveries (
+                symbol, updated_utc, account, magic, acked_utc
+            ) VALUES (?, ?, ?, ?, ?)
+        """, (sym, updated_utc, acc, mag, now_utc_iso()))
+
+        # update debug note for visibility
+        cur.execute("""
+            UPDATE debug_state
+            SET note = ?
+            WHERE symbol = ?
+        """, (f"last_ack account={acc} magic={mag} updated_utc={updated_utc}", sym))
+
+        conn.commit()
+        conn.close()
+
+    return {
+        "status": "ok",
+        "acknowledged": True,
+        "symbol": sym,
+        "updated_utc": updated_utc,
+        "account": acc,
+        "magic": mag,
+    }
+
+# -------------------------------------------------------------------
 # GATE COMPAT
 # -------------------------------------------------------------------
 @app.get("/status/gate_combo")
@@ -341,39 +616,72 @@ def gate_combo(symbol: str) -> dict[str, Any]:
 # DEBUG STATE
 # -------------------------------------------------------------------
 @app.get("/debug/state")
-def debug_state(symbol: str) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
+def debug_state(symbol: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    sym = norm_symbol(symbol or "")
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM debug_state WHERE symbol = ?", (sym,))
-        row = cur.fetchone()
+
+        if sym:
+            cur.execute("""
+                SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
+                FROM signal_state
+                WHERE symbol = ?
+            """, (sym,))
+            state_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT symbol, updated_utc, account, magic, acked_utc
+                FROM signal_deliveries
+                WHERE symbol = ?
+                ORDER BY acked_utc DESC
+            """, (sym,))
+            delivery_rows = cur.fetchall()
+        else:
+            cur.execute("""
+                SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
+                FROM signal_state
+                ORDER BY symbol
+            """)
+            state_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT symbol, updated_utc, account, magic, acked_utc
+                FROM signal_deliveries
+                ORDER BY symbol, acked_utc DESC
+            """)
+            delivery_rows = cur.fetchall()
+
         conn.close()
 
-    if row is None:
-        return {
-            "symbol": sym,
-            "state": {
-                "symbol": sym,
-                "active_action": None,
-                "updated_utc": None,
-                "note": "no signal yet"
-            },
-            "deliveries": [],
-            "server_time_utc": now_utc_iso()
-        }
+    states = []
+    for r in state_rows:
+        states.append({
+            "symbol": r["symbol"],
+            "signal_id": r["signal_id"],
+            "action": r["action"],
+            "source_ts": r["source_ts"],
+            "updated_utc": r["updated_utc"],
+            "raw_symbol": r["raw_symbol"],
+            "raw_action": r["raw_action"],
+            "note": r["note"],
+        })
+
+    deliveries = []
+    for r in delivery_rows:
+        deliveries.append({
+            "symbol": r["symbol"],
+            "updated_utc": r["updated_utc"],
+            "account": r["account"],
+            "magic": r["magic"],
+            "acked_utc": r["acked_utc"],
+        })
 
     return {
-        "symbol": sym,
-        "state": {
-            "symbol": sym,
-            "active_action": row["active_action"],
-            "updated_utc": row["updated_utc"],
-            "note": row["note"],
-        },
-        "deliveries": [],
-        "server_time_utc": now_utc_iso()
+        "server_time_utc": now_utc_iso(),
+        "states": states,
+        "deliveries": deliveries,
     }
 
 # -------------------------------------------------------------------
