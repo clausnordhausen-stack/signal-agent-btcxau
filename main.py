@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import json
 
-app = FastAPI(title="Signal Agent API", version="6.0.0")
+app = FastAPI(title="Signal Agent API", version="6.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,7 +153,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     return {"username": username}
 
 
-def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN")):
+def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
     if APP_TOKEN:
         if x_app_token != APP_TOKEN:
             raise HTTPException(status_code=401, detail="Invalid app token")
@@ -342,7 +342,7 @@ def root():
     return {
         "ok": True,
         "service": "Signal Agent API",
-        "version": "6.0.0",
+        "version": "6.1.0",
         "server_time_utc": utc_iso()
     }
 
@@ -424,7 +424,6 @@ def latest_signal(
     account = account.strip()
 
     controls = get_runtime_controls(symbol)
-    gate_auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
     gate_payload = gate_combo(symbol=symbol, account=account, magic=magic)
 
     if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
@@ -434,8 +433,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": True,
             "controls": controls,
-            "gate_auto": gate_auto_payload.get("gate"),
-            "gate_combo": gate_payload
+            "gate": gate_payload
         }
 
     with DB_LOCK:
@@ -467,8 +465,7 @@ def latest_signal(
             "symbol": symbol,
             "blocked": False,
             "controls": controls,
-            "gate_auto": gate_auto_payload.get("gate"),
-            "gate_combo": gate_payload
+            "gate": gate_payload
         }
 
     try:
@@ -482,8 +479,7 @@ def latest_signal(
         "blocked": False,
         "symbol": symbol,
         "controls": controls,
-        "gate_auto": gate_auto_payload.get("gate"),
-        "gate_combo": gate_payload,
+        "gate": gate_payload,
         "signal": row
     }
 
@@ -700,96 +696,7 @@ def post_risk(data: RiskIn):
 
 
 # -------------------------------------------------------------------
-# CONTROLS + GATES
-# -------------------------------------------------------------------
-@app.get("/controls/effective")
-def controls_effective(
-    symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard)
-):
-    return {
-        "ok": True,
-        "controls": get_runtime_controls(symbol)
-    }
-
-
-@app.get("/status/gate_auto")
-def gate_auto(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
-):
-    rows = get_deals_filtered(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
-
-    kpis = summarize_kpis(rows)
-    gate = auto_gate_from_kpis(kpis)
-
-    return {
-        "ok": True,
-        "filters": {
-            "symbol": symbol.upper() if symbol else None,
-            "account": account,
-            "magic": magic,
-            "lookback_days": lookback_days,
-            "limit_trades": limit_trades,
-        },
-        "kpis": kpis,
-        "gate": gate
-    }
-
-
-@app.get("/status/gate_combo")
-def gate_combo(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-):
-    controls = get_runtime_controls(symbol)
-    auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
-    auto_gate = auto_payload["gate"]
-
-    paused = bool(controls["paused"])
-    controls_allow = bool(controls["allow_new_entries"])
-    auto_allow = bool(auto_gate["allow_new_entries"])
-
-    allow_new_entries = (not paused) and controls_allow and auto_allow
-
-    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
-
-    gate_level = auto_gate["gate_level"]
-    if paused:
-        gate_level = "RED"
-
-    reasons = []
-    if paused:
-        reasons.append("PAUSED")
-    if not controls_allow:
-        reasons.append("CONTROL_BLOCK")
-    reasons.extend(auto_gate.get("reasons", []))
-
-    return {
-        "ok": True,
-        "symbol": symbol.upper() if symbol else None,
-        "gate_level": gate_level,
-        "allow_new_entries": allow_new_entries,
-        "risk_multiplier": round(final_risk_multiplier, 4),
-        "paused": paused,
-        "controls": controls,
-        "auto_gate": auto_gate,
-        "reasons": reasons
-    }
-
-
-# -------------------------------------------------------------------
-# KPI CORE (Phase 6)
+# KPI CORE
 # -------------------------------------------------------------------
 def get_deals_filtered(
     symbol: Optional[str] = None,
@@ -1020,7 +927,95 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -------------------------------------------------------------------
-# KPI ENDPOINTS (Phase 6)
+# CONTROLS + GATES
+# -------------------------------------------------------------------
+@app.get("/controls/effective")
+def controls_effective(
+    symbol: Optional[str] = Query(default=None),
+    _: bool = Depends(app_token_guard)
+):
+    return {
+        "ok": True,
+        "controls": get_runtime_controls(symbol)
+    }
+
+
+@app.get("/status/gate_auto")
+def gate_auto(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+    gate = auto_gate_from_kpis(kpis)
+
+    return {
+        "ok": True,
+        "filters": {
+            "symbol": symbol.upper() if symbol else None,
+            "account": account,
+            "magic": magic,
+            "lookback_days": lookback_days,
+            "limit_trades": limit_trades,
+        },
+        "kpis": kpis,
+        "gate": gate
+    }
+
+
+@app.get("/status/gate_combo")
+def gate_combo(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+):
+    controls = get_runtime_controls(symbol)
+    auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
+    auto_gate = auto_payload["gate"]
+
+    paused = bool(controls["paused"])
+    controls_allow = bool(controls["allow_new_entries"])
+    auto_allow = bool(auto_gate["allow_new_entries"])
+
+    allow_new_entries = (not paused) and controls_allow and auto_allow
+    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
+
+    gate_level = auto_gate["gate_level"]
+    if paused:
+        gate_level = "RED"
+
+    reasons = []
+    if paused:
+        reasons.append("PAUSED")
+    if not controls_allow:
+        reasons.append("CONTROL_BLOCK")
+    reasons.extend(auto_gate.get("reasons", []))
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper() if symbol else None,
+        "gate_level": gate_level,
+        "allow_new_entries": allow_new_entries,
+        "risk_multiplier": round(final_risk_multiplier, 4),
+        "paused": paused,
+        "controls": controls,
+        "auto_gate": auto_gate,
+        "reasons": reasons
+    }
+
+
+# -------------------------------------------------------------------
+# KPI ENDPOINTS
 # -------------------------------------------------------------------
 @app.get("/kpis/rolling")
 def rolling_kpis(
@@ -1070,7 +1065,7 @@ def system_overview(
     )
 
     kpis = summarize_kpis(rows)
-    gate = auto_gate_from_kpis(kpis)
+    gate = gate_combo(symbol=symbol, account=account, magic=magic)
 
     heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
