@@ -8,8 +8,9 @@ from jose import jwt, JWTError
 import os
 import sqlite3
 import threading
+import json
 
-app = FastAPI(title="Signal Agent API", version="4.1.0")
+app = FastAPI(title="Signal Agent API", version="6.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,17 +27,240 @@ SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
 HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 APP_USERNAME = os.getenv("APP_USERNAME", "admin")
 APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
 
-# App dashboard protection
+# Optional app token protection for dashboard routes
 APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
 APP_TOKEN_HEADER = os.getenv("APP_TOKEN_HEADER", "X-APP-TOKEN").strip() or "X-APP-TOKEN"
 
+# TV/API key
+TV_API_KEY = os.getenv("TV_API_KEY", SECRET_KEY)
+
+# Controls / manual overrides
+DEFAULT_ALLOW_NEW_ENTRIES = os.getenv("DEFAULT_ALLOW_NEW_ENTRIES", "true").lower() == "true"
+DEFAULT_RISK_MULTIPLIER = float(os.getenv("DEFAULT_RISK_MULTIPLIER", "1.0"))
+DEFAULT_PAUSED = os.getenv("DEFAULT_PAUSED", "false").lower() == "true"
+
+# KPI CONFIG (Phase 6)
+DEFAULT_KPI_LOOKBACK_DAYS = int(os.getenv("DEFAULT_KPI_LOOKBACK_DAYS", "7"))
+DEFAULT_KPI_LIMIT_TRADES = int(os.getenv("DEFAULT_KPI_LIMIT_TRADES", "50"))
+
+AUTO_GATE_ENABLED = os.getenv("AUTO_GATE_ENABLED", "true").lower() == "true"
+
+YELLOW_DD_PCT = float(os.getenv("YELLOW_DD_PCT", "3.0"))
+RED_DD_PCT = float(os.getenv("RED_DD_PCT", "6.0"))
+
+YELLOW_LOSS_STREAK = int(os.getenv("YELLOW_LOSS_STREAK", "3"))
+RED_LOSS_STREAK = int(os.getenv("RED_LOSS_STREAK", "5"))
+
+YELLOW_R_SUM = float(os.getenv("YELLOW_R_SUM", "-2.0"))
+RED_R_SUM = float(os.getenv("RED_R_SUM", "-4.0"))
+
+YELLOW_WINRATE_MIN = float(os.getenv("YELLOW_WINRATE_MIN", "35.0"))
+RED_WINRATE_MIN = float(os.getenv("RED_WINRATE_MIN", "25.0"))
+
 DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+
+# -------------------------------------------------------------------
+# HELPERS
+# -------------------------------------------------------------------
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_iso(dt: Optional[datetime] = None) -> str:
+    if dt is None:
+        dt = now_utc()
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        if value.endswith("Z"):
+            value = value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def dict_factory(cursor, row):
+    d = {}
+    for idx, col in enumerate(cursor.description):
+        d[col[0]] = row[idx]
+    return d
+
+
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = dict_factory
+    return conn
+
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None or x == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def safe_int(x, default=0):
+    try:
+        if x is None or x == "":
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token"
+        )
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    payload = decode_token(token)
+    username = payload.get("sub")
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload"
+        )
+    return {"username": username}
+
+
+def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN")):
+    if APP_TOKEN:
+        if x_app_token != APP_TOKEN:
+            raise HTTPException(status_code=401, detail="Invalid app token")
+    return True
+
+
+def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "paused": DEFAULT_PAUSED,
+        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
+        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
+        "symbol": symbol.upper() if symbol else None,
+        "source": "default_env"
+    }
+
+
+# -------------------------------------------------------------------
+# DB INIT
+# -------------------------------------------------------------------
+def init_db():
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            side TEXT,
+            payload_json TEXT,
+            created_utc TEXT NOT NULL,
+            updated_utc TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending'
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS signal_acks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            account TEXT NOT NULL,
+            magic TEXT,
+            ack_utc TEXT NOT NULL,
+            UNIQUE(signal_id, account, magic)
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS heartbeats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            ea_name TEXT,
+            version TEXT,
+            last_seen_utc TEXT NOT NULL,
+            status TEXT,
+            comment TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS deals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            side TEXT,
+            ticket TEXT,
+            volume REAL,
+            entry_price REAL,
+            exit_price REAL,
+            sl REAL,
+            tp REAL,
+            pnl REAL,
+            pnl_currency TEXT,
+            commission REAL,
+            swap REAL,
+            risk_amount REAL,
+            r_multiple REAL,
+            strategy TEXT,
+            deal_time_utc TEXT NOT NULL,
+            created_utc TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS risks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account TEXT,
+            magic TEXT,
+            symbol TEXT,
+            event_type TEXT,
+            level TEXT,
+            message TEXT,
+            value REAL,
+            created_utc TEXT NOT NULL
+        )
+        """)
+
+        conn.commit()
+        conn.close()
+
+
+init_db()
+
 
 # -------------------------------------------------------------------
 # MODELS
@@ -45,1669 +269,830 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str
 
+
 class UserResponse(BaseModel):
     username: str
 
-class HeartbeatPing(BaseModel):
-    key: str
+
+class TVSignalIn(BaseModel):
     symbol: str
-    account: Optional[str] = None
+    side: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+
+
+class AckIn(BaseModel):
+    symbol: str
+    updated_utc: str
+    account: str
+    magic: Optional[str] = None
+
+
+class HeartbeatPing(BaseModel):
+    key: Optional[str] = None
+    symbol: str
+    account: str
     magic: Optional[str] = None
     ea_name: Optional[str] = None
     version: Optional[str] = None
-    status: Optional[str] = None
+    status: Optional[str] = "alive"
+    comment: Optional[str] = None
 
-class RiskEvent(BaseModel):
+
+class DealIn(BaseModel):
     account: Optional[str] = None
+    magic: Optional[str] = None
     symbol: str
-    position_id: Optional[str] = None
-    magic: Optional[int] = None
-    open_time: Optional[str] = None
+    side: Optional[str] = None
+    ticket: Optional[str] = None
+    volume: Optional[float] = None
     entry_price: Optional[float] = None
-    sl: Optional[float] = None
-    lots: Optional[float] = None
-    risk_usd: Optional[float] = None
-    source: Optional[str] = None
-
-class DealEvent(BaseModel):
-    account: Optional[str] = None
-    symbol: str
-    position_id: Optional[str] = None
-    magic: Optional[int] = None
-    ticket: Optional[int] = None
-    deal_id: Optional[int] = None
-    type: str
-    lots: Optional[float] = None
-    open_time: Optional[str] = None
-    close_time: Optional[str] = None
-    open_price: Optional[float] = None
-    close_price: Optional[float] = None
+    exit_price: Optional[float] = None
     sl: Optional[float] = None
     tp: Optional[float] = None
-    profit: Optional[float] = None
-    commission: Optional[float] = None
-    swap: Optional[float] = None
-    comment: Optional[str] = None
-    risk_usd: Optional[float] = None
+    pnl: Optional[float] = None
+    pnl_currency: Optional[str] = "USD"
+    commission: Optional[float] = 0.0
+    swap: Optional[float] = 0.0
+    risk_amount: Optional[float] = None
     r_multiple: Optional[float] = None
+    strategy: Optional[str] = None
+    deal_time_utc: Optional[str] = None
 
-class ControlActionRequest(BaseModel):
-    symbol: Optional[str] = None
-    note: Optional[str] = None
 
-class ControlRiskFactorRequest(BaseModel):
-    symbol: Optional[str] = None
-    risk_factor: float
-    note: Optional[str] = None
-
-class TVSignal(BaseModel):
-    key: str
+class RiskIn(BaseModel):
+    account: Optional[str] = None
+    magic: Optional[str] = None
     symbol: str
-    action: str
-    id: Optional[str] = None
-    ts: Optional[str] = None
+    event_type: str
+    level: Optional[str] = None
+    message: Optional[str] = None
+    value: Optional[float] = None
+
 
 # -------------------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------------------
-def now_utc_dt() -> datetime:
-    return datetime.now(timezone.utc)
-
-def now_utc_iso() -> str:
-    return now_utc_dt().isoformat()
-
-def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def norm_symbol(raw: str) -> str:
-    s = (raw or "").strip().upper()
-
-    if s in {
-        "GOLD",
-        "XAU",
-        "XAUUSD",
-        "OANDA:XAUUSD",
-        "FOREXCOM:XAUUSD",
-        "CAPITALCOM:GOLD",
-    }:
-        return "XAUUSD"
-
-    if s in {
-        "BTC",
-        "BTCUSD",
-        "BITCOIN",
-        "COINBASE:BTCUSD",
-        "BINANCE:BTCUSDT",
-        "INDEX:BTCUSD",
-    }:
-        return "BTCUSD"
-
-    return s
-
-def norm_action(raw: str) -> str:
-    a = (raw or "").strip().upper()
-
-    if a in {"BUY", "LONG"}:
-        return "BUY"
-
-    if a in {"SELL", "SHORT"}:
-        return "SELL"
-
-    return ""
-
-def heartbeat_age_sec(last_seen_utc: Optional[str]) -> Optional[int]:
-    dt = parse_iso(last_seen_utc)
-    if dt is None:
-        return None
-    return max(0, int((now_utc_dt() - dt).total_seconds()))
-
-def is_heartbeat_connected(last_seen_utc: Optional[str]) -> bool:
-    age = heartbeat_age_sec(last_seen_utc)
-    if age is None:
-        return False
-    return age <= HEARTBEAT_TIMEOUT_SEC
-
-def control_scope_key(symbol: Optional[str]) -> str:
-    sym = norm_symbol(symbol or "")
-    return "GLOBAL" if not sym else sym
-
-def delivery_key(account: Optional[str], magic: Optional[str]) -> tuple[str, str]:
-    return ((account or "").strip(), (magic or "").strip())
-
-def safe_float(x: Any) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-def require_app_token(x_app_token: Optional[str]) -> None:
-    # If APP_TOKEN is not set, dashboard remains open (dev mode).
-    if not APP_TOKEN:
-        return
-    if (x_app_token or "").strip() != APP_TOKEN:
-        raise HTTPException(status_code=401, detail="bad app token")
-
-def date_matches_today(raw: Optional[str]) -> bool:
-    if not raw:
-        return False
-
-    s = raw.strip()
-    if not s:
-        return False
-
-    # ISO
-    dt = parse_iso(s)
-    if dt is not None:
-        return dt.astimezone(timezone.utc).date() == now_utc_dt().date()
-
-    # MT5 style: YYYY.MM.DD HH:MM:SS
-    today_prefix_mt5 = now_utc_dt().strftime("%Y.%m.%d")
-    if s.startswith(today_prefix_mt5):
-        return True
-
-    # ISO date only fallback
-    today_prefix_iso = now_utc_dt().strftime("%Y-%m-%d")
-    if s.startswith(today_prefix_iso):
-        return True
-
-    return False
-
-def profit_factor(values: List[float]) -> Optional[float]:
-    gp = sum(x for x in values if x > 0)
-    gl = abs(sum(x for x in values if x < 0))
-    if gl <= 0:
-        return None
-    return gp / gl
-
-def loss_streak(values: List[float]) -> int:
-    s = 0
-    for x in reversed(values):
-        if x < 0:
-            s += 1
-        else:
-            break
-    return s
-
-def max_drawdown(values: List[float]) -> float:
-    peak = 0.0
-    equity = 0.0
-    max_dd = 0.0
-
-    for p in values:
-        equity += p
-        if equity > peak:
-            peak = equity
-        dd = peak - equity
-        if dd > max_dd:
-            max_dd = dd
-
-    return max_dd
-
-def winrate(values: List[float]) -> Optional[float]:
-    if not values:
-        return None
-    wins = sum(1 for x in values if x > 0)
-    return wins / len(values)
-
-def row_net_profit(row: sqlite3.Row) -> float:
-    return (
-        safe_float(row["profit"])
-        + safe_float(row["commission"])
-        + safe_float(row["swap"])
-    )
-
-# -------------------------------------------------------------------
-# LOGIN / JWT
-# -------------------------------------------------------------------
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    to_encode = data.copy()
-    expire = now_utc_dt() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def authenticate_user(username: str, password: str) -> bool:
-    return username == APP_USERNAME and password == APP_PASSWORD
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> UserResponse:
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Ungültiger oder abgelaufener Token",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise credentials_exception
-        return UserResponse(username=username)
-    except JWTError:
-        raise credentials_exception
-
-# -------------------------------------------------------------------
-# DB
-# -------------------------------------------------------------------
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def table_cols(conn: sqlite3.Connection, table: str) -> List[str]:
-    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
-    return [r["name"] for r in rows]
-
-def ensure_control_row(conn: sqlite3.Connection, scope_key: str) -> sqlite3.Row:
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT OR IGNORE INTO control_state (
-            scope_key,
-            pause_new_trades,
-            risk_factor,
-            updated_utc,
-            updated_by,
-            note
-        ) VALUES (?, 0, 1.0, ?, ?, ?)
-    """, (scope_key, now_utc_iso(), "system", "auto-init"))
-    conn.commit()
-    cur.execute("SELECT * FROM control_state WHERE scope_key = ?", (scope_key,))
-    return cur.fetchone()
-
-def init_db() -> None:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ea_heartbeat (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            account TEXT,
-            magic TEXT,
-            ea_name TEXT,
-            version TEXT,
-            status TEXT,
-            first_seen_utc TEXT NOT NULL,
-            last_seen_utc TEXT NOT NULL,
-            updated_utc TEXT NOT NULL,
-            UNIQUE(symbol, account, magic)
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS risk_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_utc TEXT NOT NULL,
-            account TEXT,
-            symbol TEXT NOT NULL,
-            position_id TEXT,
-            magic INTEGER,
-            open_time TEXT,
-            entry_price REAL,
-            sl REAL,
-            lots REAL,
-            risk_usd REAL,
-            source TEXT
-        )
-        """)
-
-        # New institutional deals table
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS deals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_utc TEXT NOT NULL,
-            account TEXT,
-            symbol TEXT NOT NULL,
-            position_id TEXT,
-            magic INTEGER,
-            ticket INTEGER,
-            deal_id INTEGER,
-            type TEXT,
-            lots REAL,
-            open_time TEXT,
-            close_time TEXT,
-            open_price REAL,
-            close_price REAL,
-            sl REAL,
-            tp REAL,
-            profit REAL,
-            commission REAL,
-            swap REAL,
-            comment TEXT,
-            risk_usd REAL,
-            r_multiple REAL
-        )
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_deals_symbol_id
-        ON deals(symbol, id)
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_deals_position_id
-        ON deals(position_id)
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_risk_events_symbol_id
-        ON risk_events(symbol, id)
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_risk_events_position_id
-        ON risk_events(position_id)
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS control_state (
-            scope_key TEXT PRIMARY KEY,
-            pause_new_trades INTEGER NOT NULL DEFAULT 0,
-            risk_factor REAL NOT NULL DEFAULT 1.0,
-            updated_utc TEXT NOT NULL,
-            updated_by TEXT,
-            note TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS debug_state (
-            symbol TEXT PRIMARY KEY,
-            active_action TEXT,
-            updated_utc TEXT,
-            note TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS signal_state (
-            symbol TEXT PRIMARY KEY,
-            signal_id TEXT,
-            action TEXT,
-            source_ts TEXT,
-            updated_utc TEXT NOT NULL,
-            raw_symbol TEXT,
-            raw_action TEXT,
-            note TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS signal_deliveries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            updated_utc TEXT NOT NULL,
-            account TEXT NOT NULL,
-            magic TEXT NOT NULL,
-            acked_utc TEXT NOT NULL,
-            UNIQUE(symbol, updated_utc, account, magic)
-        )
-        """)
-
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_signal_deliveries_lookup
-        ON signal_deliveries(symbol, updated_utc, account, magic)
-        """)
-
-        # safe migrations
-        dcols = table_cols(conn, "deals")
-        for col, coldef in [
-            ("position_id", "TEXT"),
-            ("risk_usd", "REAL"),
-            ("r_multiple", "REAL"),
-            ("deal_id", "INTEGER"),
-            ("ticket", "INTEGER"),
-        ]:
-            if col not in dcols:
-                try:
-                    cur.execute(f"ALTER TABLE deals ADD COLUMN {col} {coldef}")
-                except Exception:
-                    pass
-
-        conn.commit()
-
-        ensure_control_row(conn, "GLOBAL")
-        ensure_control_row(conn, "XAUUSD")
-        ensure_control_row(conn, "BTCUSD")
-
-        conn.close()
-
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
-
-# -------------------------------------------------------------------
-# CONTROL STATE HELPERS
-# -------------------------------------------------------------------
-def get_control_state_payload(conn: sqlite3.Connection, symbol: Optional[str]) -> dict[str, Any]:
-    global_row = ensure_control_row(conn, "GLOBAL")
-
-    sym = norm_symbol(symbol or "")
-    symbol_row = ensure_control_row(conn, sym) if sym else None
-
-    global_pause = int(global_row["pause_new_trades"]) == 1
-    global_rf = float(global_row["risk_factor"])
-
-    symbol_pause = False
-    symbol_rf = 1.0
-
-    if symbol_row is not None:
-        symbol_pause = int(symbol_row["pause_new_trades"]) == 1
-        symbol_rf = float(symbol_row["risk_factor"])
-
-    effective_pause = global_pause or symbol_pause
-    effective_rf = min(global_rf, symbol_rf) if symbol_row is not None else global_rf
-
-    return {
-        "symbol": sym or None,
-        "global": {
-            "scope_key": global_row["scope_key"],
-            "pause_new_trades": global_pause,
-            "risk_factor": global_rf,
-            "updated_utc": global_row["updated_utc"],
-            "updated_by": global_row["updated_by"],
-            "note": global_row["note"],
-        },
-        "symbol_control": None if symbol_row is None else {
-            "scope_key": symbol_row["scope_key"],
-            "pause_new_trades": symbol_pause,
-            "risk_factor": symbol_rf,
-            "updated_utc": symbol_row["updated_utc"],
-            "updated_by": symbol_row["updated_by"],
-            "note": symbol_row["note"],
-        },
-        "effective": {
-            "pause_new_trades": effective_pause,
-            "risk_factor": effective_rf,
-        },
-        "effective_pause_new_trades": effective_pause,
-        "effective_risk_factor": effective_rf,
-    }
-
-# -------------------------------------------------------------------
-# ROOT
+# BASIC ROUTES
 # -------------------------------------------------------------------
 @app.get("/")
-def root() -> dict[str, Any]:
-    return {
-        "status": "Signal Agent API running",
-        "mode": "dashboard_backend_plus_signal_agent",
-        "login_enabled": True,
-        "heartbeat_timeout_sec": HEARTBEAT_TIMEOUT_SEC,
-        "app_token_protected": bool(APP_TOKEN),
-    }
-
-@app.get("/health")
-def health() -> dict[str, Any]:
-    with DB_LOCK:
-        conn = get_conn()
-        conn.execute("SELECT 1").fetchone()
-        conn.close()
-
+def root():
     return {
         "ok": True,
-        "utc": now_utc_iso(),
-        "db_path": DB_PATH,
-        "app_token_configured": bool(APP_TOKEN),
+        "service": "Signal Agent API",
+        "version": "6.0.0",
+        "server_time_utc": utc_iso()
     }
 
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "signal-agent-api",
+        "time": utc_iso()
+    }
+
+
 # -------------------------------------------------------------------
-# LOGIN
+# AUTH ROUTES
 # -------------------------------------------------------------------
 @app.post("/login", response_model=TokenResponse)
-def login(data: LoginRequest) -> dict[str, str]:
-    if not authenticate_user(data.username, data.password):
-        raise HTTPException(status_code=401, detail="Benutzername oder Passwort falsch")
+def login(data: LoginRequest):
+    username = data.username.strip()
+    password = data.password.strip()
 
-    access_token = create_access_token(
-        data={"sub": data.username},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
+    if username != APP_USERNAME or password != APP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    access_token = create_access_token({"sub": username})
     return {
         "access_token": access_token,
         "token_type": "bearer"
     }
 
+
 @app.get("/me", response_model=UserResponse)
-def me(current_user: UserResponse = Depends(get_current_user)) -> UserResponse:
-    return current_user
+def me(current_user: dict = Depends(get_current_user)):
+    return {"username": current_user["username"]}
+
 
 # -------------------------------------------------------------------
-# SIGNAL AGENT: TV
+# SIGNAL ROUTES
 # -------------------------------------------------------------------
 @app.post("/tv")
-def tv(signal: TVSignal) -> dict[str, Any]:
-    if signal.key != SECRET_KEY:
-        raise HTTPException(status_code=401, detail="invalid key")
+def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
+    if x_api_key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
-    sym = norm_symbol(signal.symbol)
-    action = norm_action(signal.action)
-
-    if not sym:
-        raise HTTPException(status_code=400, detail="invalid symbol")
-
-    if not action:
-        raise HTTPException(status_code=400, detail="invalid action")
-
-    updated_utc = now_utc_iso()
-    signal_id = (signal.id or "").strip()
-    if not signal_id:
-        signal_id = f"{sym}{action}{updated_utc}"
-
-    source_ts = (signal.ts or "").strip()
-    note = f"tv id={signal_id} ts={source_ts} raw_symbol={signal.symbol} raw_action={signal.action}"
+    symbol = data.symbol.strip().upper()
+    side = (data.side or "").strip().upper()
+    payload_json = json.dumps(data.payload or {}, ensure_ascii=False)
+    now = utc_iso()
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
-            INSERT INTO signal_state (
-                symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(symbol) DO UPDATE SET
-                signal_id   = excluded.signal_id,
-                action      = excluded.action,
-                source_ts   = excluded.source_ts,
-                updated_utc = excluded.updated_utc,
-                raw_symbol  = excluded.raw_symbol,
-                raw_action  = excluded.raw_action,
-                note        = excluded.note
-        """, (
-            sym,
-            signal_id,
-            action,
-            source_ts,
-            updated_utc,
-            signal.symbol,
-            signal.action,
-            note,
-        ))
+        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (symbol, side, payload_json, now, now))
 
-        cur.execute("""
-            INSERT INTO debug_state (symbol, active_action, updated_utc, note)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(symbol) DO UPDATE SET
-                active_action = excluded.active_action,
-                updated_utc   = excluded.updated_utc,
-                note          = excluded.note
-        """, (sym, action, updated_utc, note))
-
+        signal_id = cur.lastrowid
         conn.commit()
         conn.close()
 
     return {
-        "status": "ok",
-        "symbol": sym,
-        "action": action,
-        "id": signal_id,
-        "updated_utc": updated_utc,
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "created_utc": now
     }
 
-@app.post("/webhook")
-def webhook_alias(signal: TVSignal) -> dict[str, Any]:
-    return tv(signal)
 
-# -------------------------------------------------------------------
-# SIGNAL AGENT: LATEST
-# -------------------------------------------------------------------
 @app.get("/latest")
-def latest(
-    symbol: str,
-    account: Optional[str] = Query(default=None),
+def latest_signal(
+    symbol: str = Query(...),
+    account: str = Query(...),
     magic: Optional[str] = Query(default=None),
-) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
-    acc, mag = delivery_key(account, magic)
+):
+    symbol = symbol.strip().upper()
+    account = account.strip()
+
+    controls = get_runtime_controls(symbol)
+    gate_auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
+    gate_payload = gate_combo(symbol=symbol, account=account, magic=magic)
+
+    if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "symbol": symbol,
+            "blocked": True,
+            "controls": controls,
+            "gate_auto": gate_auto_payload.get("gate"),
+            "gate_combo": gate_payload
+        }
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
-            FROM signal_state
-            WHERE symbol = ?
-        """, (sym,))
+        SELECT s.*
+        FROM signals s
+        WHERE s.symbol = ?
+          AND s.status = 'pending'
+          AND NOT EXISTS (
+              SELECT 1 FROM signal_acks a
+              WHERE a.signal_id = s.id
+                AND a.account = ?
+                AND COALESCE(a.magic, '') = COALESCE(?, '')
+          )
+        ORDER BY s.id DESC
+        LIMIT 1
+        """, (symbol, account, magic))
+
         row = cur.fetchone()
-
-        if row is None or not row["action"] or not row["updated_utc"]:
-            conn.close()
-            return {"signal": None}
-
-        if acc and mag:
-            cur.execute("""
-                SELECT 1
-                FROM signal_deliveries
-                WHERE symbol = ? AND updated_utc = ? AND account = ? AND magic = ?
-                LIMIT 1
-            """, (sym, row["updated_utc"], acc, mag))
-            ack_row = cur.fetchone()
-            if ack_row is not None:
-                conn.close()
-                return {"signal": None}
-
         conn.close()
 
+    if not row:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "symbol": symbol,
+            "blocked": False,
+            "controls": controls,
+            "gate_auto": gate_auto_payload.get("gate"),
+            "gate_combo": gate_payload
+        }
+
+    try:
+        row["payload"] = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        row["payload"] = {}
+
     return {
-        "signal": {
-            "symbol": row["symbol"],
-            "action": row["action"],
-            "id": row["signal_id"],
-            "ts": row["source_ts"],
-        },
-        "updated_utc": row["updated_utc"],
-        "note": row["note"],
-        "account": account,
-        "magic": magic,
+        "ok": True,
+        "has_signal": True,
+        "blocked": False,
+        "symbol": symbol,
+        "controls": controls,
+        "gate_auto": gate_auto_payload.get("gate"),
+        "gate_combo": gate_payload,
+        "signal": row
     }
 
-# -------------------------------------------------------------------
-# SIGNAL AGENT: ACK
-# -------------------------------------------------------------------
+
 @app.post("/ack")
-def ack(
-    symbol: str,
-    updated_utc: str,
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
-    acc, mag = delivery_key(account, magic)
-
-    if not acc:
-        raise HTTPException(status_code=400, detail="account required")
-    if not mag:
-        raise HTTPException(status_code=400, detail="magic required")
-    if not updated_utc:
-        raise HTTPException(status_code=400, detail="updated_utc required")
+def ack_signal(data: AckIn):
+    symbol = data.symbol.strip().upper()
+    account = data.account.strip()
+    magic = data.magic
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
-            SELECT symbol, updated_utc
-            FROM signal_state
-            WHERE symbol = ?
-        """, (sym,))
+        SELECT *
+        FROM signals
+        WHERE symbol = ?
+          AND updated_utc = ?
+          AND status = 'pending'
+        ORDER BY id DESC
+        LIMIT 1
+        """, (symbol, data.updated_utc))
+
         row = cur.fetchone()
-
-        if row is None:
+        if not row:
             conn.close()
-            return {
-                "status": "ok",
-                "acknowledged": False,
-                "reason": "no signal for symbol",
-                "symbol": sym,
-            }
+            raise HTTPException(status_code=404, detail="Signal not found")
 
-        if row["updated_utc"] != updated_utc:
-            conn.close()
-            return {
-                "status": "ok",
-                "acknowledged": False,
-                "reason": "updated_utc mismatch",
-                "symbol": sym,
-                "server_updated_utc": row["updated_utc"],
-            }
+        signal_id = row["id"]
 
         cur.execute("""
-            INSERT OR IGNORE INTO signal_deliveries (
-                symbol, updated_utc, account, magic, acked_utc
-            ) VALUES (?, ?, ?, ?, ?)
-        """, (sym, updated_utc, acc, mag, now_utc_iso()))
-
-        cur.execute("""
-            UPDATE debug_state
-            SET note = ?
-            WHERE symbol = ?
-        """, (f"last_ack account={acc} magic={mag} updated_utc={updated_utc}", sym))
+        INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc)
+        VALUES (?, ?, ?, ?, ?)
+        """, (signal_id, symbol, account, magic, utc_iso()))
 
         conn.commit()
         conn.close()
 
     return {
-        "status": "ok",
-        "acknowledged": True,
-        "symbol": sym,
-        "updated_utc": updated_utc,
-        "account": acc,
-        "magic": mag,
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "account": account,
+        "magic": magic
     }
 
-# -------------------------------------------------------------------
-# GATE COMPAT
-# -------------------------------------------------------------------
-# Intentionally kept compatible for existing EAs.
-@app.get("/status/gate_combo")
-def gate_combo(symbol: str) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
-    lvl = DEFAULT_GATE_LEVEL if DEFAULT_GATE_LEVEL in {"GREEN", "YELLOW", "RED"} else "GREEN"
-
-    return {
-        "symbol": sym,
-        "combo_level": lvl,
-        "usd_level": lvl,
-        "r_level": lvl
-    }
-
-# -------------------------------------------------------------------
-# DEBUG STATE
-# -------------------------------------------------------------------
-@app.get("/debug/state")
-def debug_state(symbol: Optional[str] = Query(default=None)) -> dict[str, Any]:
-    sym = norm_symbol(symbol or "")
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        if sym:
-            cur.execute("""
-                SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
-                FROM signal_state
-                WHERE symbol = ?
-            """, (sym,))
-            state_rows = cur.fetchall()
-
-            cur.execute("""
-                SELECT symbol, updated_utc, account, magic, acked_utc
-                FROM signal_deliveries
-                WHERE symbol = ?
-                ORDER BY acked_utc DESC
-            """, (sym,))
-            delivery_rows = cur.fetchall()
-        else:
-            cur.execute("""
-                SELECT symbol, signal_id, action, source_ts, updated_utc, raw_symbol, raw_action, note
-                FROM signal_state
-                ORDER BY symbol
-            """)
-            state_rows = cur.fetchall()
-
-            cur.execute("""
-                SELECT symbol, updated_utc, account, magic, acked_utc
-                FROM signal_deliveries
-                ORDER BY symbol, acked_utc DESC
-            """)
-            delivery_rows = cur.fetchall()
-
-        conn.close()
-
-    states = []
-    for r in state_rows:
-        states.append({
-            "symbol": r["symbol"],
-            "signal_id": r["signal_id"],
-            "action": r["action"],
-            "source_ts": r["source_ts"],
-            "updated_utc": r["updated_utc"],
-            "raw_symbol": r["raw_symbol"],
-            "raw_action": r["raw_action"],
-            "note": r["note"],
-        })
-
-    deliveries = []
-    for r in delivery_rows:
-        deliveries.append({
-            "symbol": r["symbol"],
-            "updated_utc": r["updated_utc"],
-            "account": r["account"],
-            "magic": r["magic"],
-            "acked_utc": r["acked_utc"],
-        })
-
-    return {
-        "server_time_utc": now_utc_iso(),
-        "states": states,
-        "deliveries": deliveries,
-    }
-
-# -------------------------------------------------------------------
-# RISK
-# -------------------------------------------------------------------
-@app.post("/risk")
-def risk(event: RiskEvent) -> dict[str, Any]:
-    sym = norm_symbol(event.symbol)
-    if not sym:
-        raise HTTPException(status_code=400, detail="symbol required")
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO risk_events (
-                created_utc, account, symbol, position_id, magic, open_time,
-                entry_price, sl, lots, risk_usd, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            now_utc_iso(),
-            event.account,
-            sym,
-            event.position_id,
-            event.magic,
-            event.open_time,
-            event.entry_price,
-            event.sl,
-            event.lots,
-            event.risk_usd,
-            event.source
-        ))
-        conn.commit()
-        conn.close()
-
-    return {"status": "ok"}
-
-# -------------------------------------------------------------------
-# DEALS (NEW, safe addition)
-# -------------------------------------------------------------------
-@app.post("/deal")
-def deal(event: DealEvent) -> dict[str, Any]:
-    sym = norm_symbol(event.symbol)
-    if not sym:
-        raise HTTPException(status_code=400, detail="symbol required")
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        if event.deal_id is not None:
-            row = cur.execute(
-                "SELECT id FROM deals WHERE deal_id = ? LIMIT 1",
-                (int(event.deal_id),),
-            ).fetchone()
-            if row is not None:
-                conn.close()
-                return {"status": "ok", "dedup": True, "id": int(row["id"])}
-
-        cur.execute("""
-            INSERT INTO deals (
-                created_utc, account, symbol, position_id, magic, ticket, deal_id, type,
-                lots, open_time, close_time, open_price, close_price, sl, tp,
-                profit, commission, swap, comment, risk_usd, r_multiple
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            now_utc_iso(),
-            event.account,
-            sym,
-            event.position_id,
-            event.magic,
-            event.ticket,
-            event.deal_id,
-            event.type,
-            event.lots,
-            event.open_time,
-            event.close_time,
-            event.open_price,
-            event.close_price,
-            event.sl,
-            event.tp,
-            event.profit,
-            event.commission,
-            event.swap,
-            event.comment,
-            event.risk_usd,
-            event.r_multiple,
-        ))
-
-        conn.commit()
-        row_id = cur.lastrowid
-        conn.close()
-
-    return {"status": "ok", "id": row_id}
-
-@app.get("/deals")
-def deals(symbol: Optional[str] = Query(default=None), limit: int = 50) -> dict[str, Any]:
-    limit = max(1, min(int(limit), 500))
-    sym = norm_symbol(symbol or "")
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        if sym:
-            cur.execute("""
-                SELECT *
-                FROM deals
-                WHERE symbol = ?
-                ORDER BY id DESC
-                LIMIT ?
-            """, (sym, limit))
-        else:
-            cur.execute("""
-                SELECT *
-                FROM deals
-                ORDER BY id DESC
-                LIMIT ?
-            """, (limit,))
-
-        rows = cur.fetchall()
-        conn.close()
-
-    return {"items": [dict(r) for r in rows], "count": len(rows)}
 
 # -------------------------------------------------------------------
 # HEARTBEAT
 # -------------------------------------------------------------------
-@app.post("/heartbeat")
-def heartbeat(ping: HeartbeatPing) -> dict[str, Any]:
-    if ping.key != SECRET_KEY:
-        raise HTTPException(status_code=401, detail="invalid key")
-
-    sym = norm_symbol(ping.symbol)
-    acc = (ping.account or "").strip()
-    mag = (ping.magic or "").strip()
-    ea_name = (ping.ea_name or "").strip() or None
-    version = (ping.version or "").strip() or None
-    hb_status = (ping.status or "").strip() or "running"
-
-    if not sym:
-        raise HTTPException(status_code=400, detail="symbol required")
-    if not acc:
-        raise HTTPException(status_code=400, detail="account required")
-    if not mag:
-        raise HTTPException(status_code=400, detail="magic required")
-
-    now_iso = now_utc_iso()
+@app.post("/hb")
+def heartbeat(data: HeartbeatPing):
+    if data.key and data.key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid key")
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
-            INSERT OR IGNORE INTO ea_heartbeat (
-                symbol, account, magic, ea_name, version, status,
-                first_seen_utc, last_seen_utc, updated_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            sym, acc, mag, ea_name, version, hb_status,
-            now_iso, now_iso, now_iso
-        ))
-
-        conn.commit()
-
-        cur.execute("""
-            UPDATE ea_heartbeat
-            SET
-                ea_name = COALESCE(?, ea_name),
-                version = COALESCE(?, version),
-                status = ?,
-                last_seen_utc = ?,
-                updated_utc = ?
-            WHERE symbol = ? AND account = ? AND magic = ?
-        """, (
-            ea_name,
-            version,
-            hb_status,
-            now_iso,
-            now_iso,
-            sym,
-            acc,
-            mag
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.ea_name,
+            data.version,
+            utc_iso(),
+            data.status,
+            data.comment
         ))
 
         conn.commit()
         conn.close()
 
-    return {
-        "status": "ok",
-        "symbol": sym,
-        "account": acc,
-        "magic": mag,
-        "last_seen_utc": now_iso
-    }
+    return {"ok": True, "server_time_utc": utc_iso()}
 
-@app.get("/heartbeat/status")
-def heartbeat_status(symbol: str) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
 
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT symbol, account, magic, ea_name, version, status, last_seen_utc
-            FROM ea_heartbeat
-            WHERE symbol = ?
-            ORDER BY last_seen_utc DESC
-            LIMIT 1
-        """, (sym,))
-        row = cur.fetchone()
-        conn.close()
-
-    if row is None:
-        return {
-            "symbol": sym,
-            "connected": False,
-            "last_seen_utc": None,
-            "age_sec": None,
-            "account": None,
-            "magic": None,
-            "ea_name": None,
-            "version": None,
-            "status": "offline",
-            "timeout_sec": HEARTBEAT_TIMEOUT_SEC
-        }
-
-    last_seen = row["last_seen_utc"]
-    connected = is_heartbeat_connected(last_seen)
-
-    return {
-        "symbol": sym,
-        "connected": connected,
-        "last_seen_utc": last_seen,
-        "age_sec": heartbeat_age_sec(last_seen),
-        "account": row["account"],
-        "magic": row["magic"],
-        "ea_name": row["ea_name"],
-        "version": row["version"],
-        "status": row["status"] if connected else "offline",
-        "timeout_sec": HEARTBEAT_TIMEOUT_SEC
-    }
-
-@app.get("/heartbeat/overview")
-def heartbeat_overview() -> dict[str, Any]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT symbol, account, magic, ea_name, version, status, last_seen_utc
-            FROM ea_heartbeat
-            ORDER BY symbol, last_seen_utc DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-
-    items = []
-    for r in rows:
-        last_seen = r["last_seen_utc"]
-        items.append({
-            "symbol": r["symbol"],
-            "account": r["account"],
-            "magic": r["magic"],
-            "ea_name": r["ea_name"],
-            "version": r["version"],
-            "last_seen_utc": last_seen,
-            "age_sec": heartbeat_age_sec(last_seen),
-            "connected": is_heartbeat_connected(last_seen),
-            "status": r["status"] if is_heartbeat_connected(last_seen) else "offline",
-        })
-
-    return {
-        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
-        "items": items
-    }
-
-# -------------------------------------------------------------------
-# CONTROL STATE
-# -------------------------------------------------------------------
-@app.get("/control/state")
-def control_state(symbol: Optional[str] = Query(default=None)) -> dict[str, Any]:
-    with DB_LOCK:
-        conn = get_conn()
-        payload = get_control_state_payload(conn, symbol)
-        conn.close()
-    return payload
-
-@app.post("/control/pause")
-def control_pause(
-    data: ControlActionRequest,
-    current_user: UserResponse = Depends(get_current_user),
-) -> dict[str, Any]:
-    scope_key = control_scope_key(data.symbol)
-
-    with DB_LOCK:
-        conn = get_conn()
-        ensure_control_row(conn, scope_key)
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE control_state
-            SET
-                pause_new_trades = 1,
-                updated_utc = ?,
-                updated_by = ?,
-                note = ?
-            WHERE scope_key = ?
-        """, (
-            now_utc_iso(),
-            current_user.username,
-            data.note or "paused via app",
-            scope_key
-        ))
-        conn.commit()
-        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
-        conn.close()
-
-    return {
-        "status": "ok",
-        "action": "pause",
-        "scope_key": scope_key,
-        "control": payload
-    }
-
-@app.post("/control/resume")
-def control_resume(
-    data: ControlActionRequest,
-    current_user: UserResponse = Depends(get_current_user),
-) -> dict[str, Any]:
-    scope_key = control_scope_key(data.symbol)
-
-    with DB_LOCK:
-        conn = get_conn()
-        ensure_control_row(conn, scope_key)
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE control_state
-            SET
-                pause_new_trades = 0,
-                updated_utc = ?,
-                updated_by = ?,
-                note = ?
-            WHERE scope_key = ?
-        """, (
-            now_utc_iso(),
-            current_user.username,
-            data.note or "resumed via app",
-            scope_key
-        ))
-        conn.commit()
-        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
-        conn.close()
-
-    return {
-        "status": "ok",
-        "action": "resume",
-        "scope_key": scope_key,
-        "control": payload
-    }
-
-@app.post("/control/risk_factor")
-def control_risk_factor(
-    data: ControlRiskFactorRequest,
-    current_user: UserResponse = Depends(get_current_user),
-) -> dict[str, Any]:
-    if data.risk_factor <= 0 or data.risk_factor > 1.0:
-        raise HTTPException(status_code=400, detail="risk_factor must be > 0 and <= 1.0")
-
-    scope_key = control_scope_key(data.symbol)
-
-    with DB_LOCK:
-        conn = get_conn()
-        ensure_control_row(conn, scope_key)
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE control_state
-            SET
-                risk_factor = ?,
-                updated_utc = ?,
-                updated_by = ?,
-                note = ?
-            WHERE scope_key = ?
-        """, (
-            float(data.risk_factor),
-            now_utc_iso(),
-            current_user.username,
-            data.note or "risk factor updated via app",
-            scope_key
-        ))
-        conn.commit()
-        payload = get_control_state_payload(conn, None if scope_key == "GLOBAL" else scope_key)
-        conn.close()
-
-    return {
-        "status": "ok",
-        "action": "risk_factor",
-        "scope_key": scope_key,
-        "control": payload
-    }
-
-# -------------------------------------------------------------------
-# HISTORY / COMPAT
-# -------------------------------------------------------------------
-@app.get("/signals/history")
-def signals_history(limit: int = 20) -> dict[str, Any]:
-    limit = max(1, min(int(limit), 200))
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT symbol, signal_id, action, source_ts, updated_utc, note
-            FROM signal_state
-            ORDER BY updated_utc DESC
-            LIMIT ?
-        """, (limit,))
-        rows = cur.fetchall()
-        conn.close()
-
-    signals = []
-    for r in rows:
-        signals.append({
-            "symbol": r["symbol"],
-            "action": r["action"],
-            "status": "active",
-            "time": r["updated_utc"],
-            "tv_id": r["signal_id"],
-            "tv_ts": r["source_ts"],
-            "updated_utc": r["updated_utc"],
-            "note": r["note"],
-        })
-
-    return {"signals": signals}
-
-@app.get("/risk/history")
-def risk_history(limit: int = 20) -> dict[str, Any]:
-    limit = max(1, min(int(limit), 200))
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT created_utc, account, symbol, risk_usd, lots, position_id, magic, entry_price, sl, open_time
-            FROM risk_events
-            ORDER BY id DESC
-            LIMIT ?
-        """, (limit,))
-        rows = cur.fetchall()
-        conn.close()
-
-    risk = []
-    for r in rows:
-        risk.append({
-            "time": r["created_utc"],
-            "account": r["account"],
-            "symbol": r["symbol"],
-            "risk_usd": r["risk_usd"],
-            "lots": r["lots"],
-            "position_id": r["position_id"],
-            "magic": r["magic"],
-            "entry_price": r["entry_price"],
-            "sl": r["sl"],
-            "open_time": r["open_time"],
-        })
-
-    return {"risk": risk}
-
-@app.get("/accounts/overview")
-def accounts_overview() -> dict[str, Any]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT
-                account,
-                COUNT(*) AS risk_event_count,
-                MAX(created_utc) AS last_event_utc,
-                ROUND(COALESCE(SUM(risk_usd), 0), 2) AS total_risk_usd
-            FROM risk_events
-            WHERE account IS NOT NULL
-              AND TRIM(account) <> ''
-            GROUP BY account
-            ORDER BY last_event_utc DESC
-        """)
-        rows = cur.fetchall()
-        conn.close()
-
-    return {
-        "accounts": [
-            {
-                "account": r["account"],
-                "risk_event_count": r["risk_event_count"],
-                "last_event_utc": r["last_event_utc"],
-                "total_risk_usd": r["total_risk_usd"],
-            }
-            for r in rows
-        ]
-    }
-
-# -------------------------------------------------------------------
-# KPI HELPERS
-# -------------------------------------------------------------------
-def fetch_deal_rows(symbol: str) -> List[sqlite3.Row]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT *
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id ASC
-        """, (symbol,))
-        rows = cur.fetchall()
-        conn.close()
-    return rows
-
-def fetch_deal_rows_last_n(symbol: str, n: int) -> List[sqlite3.Row]:
-    n = max(1, min(int(n), 500))
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT *
-            FROM deals
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT ?
-        """, (symbol, n))
-        rows = cur.fetchall()
-        conn.close()
-    rows.reverse()
-    return rows
-
-def fetch_risk_rows(symbol: str) -> List[sqlite3.Row]:
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT *
-            FROM risk_events
-            WHERE symbol = ?
-            ORDER BY id ASC
-        """, (symbol,))
-        rows = cur.fetchall()
-        conn.close()
-    return rows
-
-def daily_pnl(symbol: str) -> float:
-    rows = fetch_deal_rows(symbol)
-    return round(sum(row_net_profit(r) for r in rows if date_matches_today(r["close_time"])), 2)
-
-def daily_r(symbol: str) -> float:
-    rows = fetch_deal_rows(symbol)
-    values = [
-        safe_float(r["r_multiple"])
-        for r in rows
-        if r["r_multiple"] is not None and date_matches_today(r["close_time"])
-    ]
-    return round(sum(values), 4)
-
-def trade_count_today(symbol: str) -> int:
-    rows = fetch_deal_rows(symbol)
-    return sum(1 for r in rows if date_matches_today(r["close_time"]))
-
-def rolling_pnl_last_n(symbol: str, n: int) -> float:
-    rows = fetch_deal_rows_last_n(symbol, n)
-    return round(sum(row_net_profit(r) for r in rows), 2)
-
-def rolling_r_last_n(symbol: str, n: int) -> float:
-    rows = fetch_deal_rows_last_n(symbol, n)
-    values = [safe_float(r["r_multiple"]) for r in rows if r["r_multiple"] is not None]
-    return round(sum(values), 4)
-
-def profit_factor_last_n(symbol: str, n: int) -> Optional[float]:
-    rows = fetch_deal_rows_last_n(symbol, n)
-    values = [row_net_profit(r) for r in rows]
-    pf = profit_factor(values)
-    return None if pf is None else round(pf, 4)
-
-def winrate_last_n(symbol: str, n: int) -> Optional[float]:
-    rows = fetch_deal_rows_last_n(symbol, n)
-    values = [row_net_profit(r) for r in rows]
-    wr = winrate(values)
-    return None if wr is None else round(wr, 4)
-
-def loss_streak_last_n(symbol: str, n: int) -> int:
-    rows = fetch_deal_rows_last_n(symbol, n)
-    values = [row_net_profit(r) for r in rows]
-    return loss_streak(values)
-
-def max_drawdown_usd(symbol: str) -> float:
-    rows = fetch_deal_rows(symbol)
-    values = [row_net_profit(r) for r in rows]
-    return round(max_drawdown(values), 2)
-
-def max_drawdown_r(symbol: str) -> float:
-    rows = fetch_deal_rows(symbol)
-    values = [safe_float(r["r_multiple"]) for r in rows if r["r_multiple"] is not None]
-    return round(max_drawdown(values), 4)
-
-def open_risk_usd(symbol: str) -> float:
-    rows = fetch_risk_rows(symbol)
-
-    # latest row per position_id only
-    latest_by_position: Dict[str, sqlite3.Row] = {}
-    for r in rows:
-        pos_id = (r["position_id"] or "").strip()
-        if not pos_id:
-            continue
-        latest_by_position[pos_id] = r
-
-    total = 0.0
-    for r in latest_by_position.values():
-        total += safe_float(r["risk_usd"])
-
-    return round(total, 2)
-
-def institutional_kpis(symbol: str, n: int = 20) -> dict[str, Any]:
-    sym = norm_symbol(symbol)
-    rows_last_n = fetch_deal_rows_last_n(sym, n)
-
-    net_values_last_n = [row_net_profit(r) for r in rows_last_n]
-    r_values_last_n = [safe_float(r["r_multiple"]) for r in rows_last_n if r["r_multiple"] is not None]
-
-    pf_r = profit_factor(r_values_last_n)
-    sample_size = len(rows_last_n)
-
-    return {
-        "daily_pnl": daily_pnl(sym),
-        "daily_r": daily_r(sym),
-        "trade_count_today": trade_count_today(sym),
-        "rolling_pnl_last_n": rolling_pnl_last_n(sym, n),
-        "rolling_r_last_n": rolling_r_last_n(sym, n),
-        "profit_factor_last_n": profit_factor_last_n(sym, n),
-        "profit_factor_r_last_n": None if pf_r is None else round(pf_r, 4),
-        "winrate_last_n": winrate_last_n(sym, n),
-        "loss_streak_last_n": loss_streak_last_n(sym, n),
-        "max_drawdown_usd": max_drawdown_usd(sym),
-        "max_drawdown_r": max_drawdown_r(sym),
-        "open_risk_usd": open_risk_usd(sym),
-        "sample_size_last_n": sample_size,
-    }
-
-def portfolio_institutional_kpis(symbols: List[str], n: int = 20) -> dict[str, Any]:
-    daily_pnl_sum = 0.0
-    daily_r_sum = 0.0
-    trade_count_sum = 0
-    rolling_pnl_sum = 0.0
-    rolling_r_sum = 0.0
-    max_dd_usd = 0.0
-    max_dd_r = 0.0
-    open_risk_sum = 0.0
-
-    merged_net_values: List[float] = []
-
-    for sym in symbols:
-        k = institutional_kpis(sym, n=n)
-        daily_pnl_sum += safe_float(k["daily_pnl"])
-        daily_r_sum += safe_float(k["daily_r"])
-        trade_count_sum += int(k["trade_count_today"])
-        rolling_pnl_sum += safe_float(k["rolling_pnl_last_n"])
-        rolling_r_sum += safe_float(k["rolling_r_last_n"])
-        max_dd_usd = max(max_dd_usd, safe_float(k["max_drawdown_usd"]))
-        max_dd_r = max(max_dd_r, safe_float(k["max_drawdown_r"]))
-        open_risk_sum += safe_float(k["open_risk_usd"])
-
-        rows_last_n = fetch_deal_rows_last_n(sym, n)
-        merged_net_values.extend([row_net_profit(r) for r in rows_last_n])
-
-    pf = profit_factor(merged_net_values)
-    wr = winrate(merged_net_values)
-
-    return {
-        "daily_pnl": round(daily_pnl_sum, 2),
-        "daily_r": round(daily_r_sum, 4),
-        "trade_count_today": trade_count_sum,
-        "rolling_pnl_last_n": round(rolling_pnl_sum, 2),
-        "rolling_r_last_n": round(rolling_r_sum, 4),
-        "profit_factor_last_n": None if pf is None else round(pf, 4),
-        "winrate_last_n": None if wr is None else round(wr, 4),
-        "max_drawdown_usd": round(max_dd_usd, 2),
-        "max_drawdown_r": round(max_dd_r, 4),
-        "open_risk_usd": round(open_risk_sum, 2),
-        "sample_size_last_n": len(merged_net_values),
-    }
-
-# -------------------------------------------------------------------
-# DASHBOARD
-# -------------------------------------------------------------------
-def last_rows(table: str, symbol: Optional[str], limit: int) -> List[dict]:
-    limit = max(1, min(int(limit), 200))
-    sym = norm_symbol(symbol or "")
+@app.get("/status/heartbeat")
+def heartbeat_status(symbol: Optional[str] = Query(default=None)):
+    symbol_norm = symbol.strip().upper() if symbol else None
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
-        if table == "deals":
-            if sym:
-                cur.execute("""
-                    SELECT *
-                    FROM deals
-                    WHERE symbol = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (sym, limit))
-            else:
-                cur.execute("""
-                    SELECT *
-                    FROM deals
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (limit,))
-        elif table == "risk_events":
-            if sym:
-                cur.execute("""
-                    SELECT *
-                    FROM risk_events
-                    WHERE symbol = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (sym, limit))
-            else:
-                cur.execute("""
-                    SELECT *
-                    FROM risk_events
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (limit,))
-        else:
-            conn.close()
-            return []
-
-        rows = cur.fetchall()
-        conn.close()
-
-    return [dict(r) for r in rows]
-
-@app.get("/dashboard")
-def dashboard(
-    symbols: str = "BTCUSD,XAUUSD",
-    limit_deals: int = 10,
-    limit_risks: int = 10,
-    n_gate: int = 20,
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-) -> dict[str, Any]:
-    require_app_token(x_app_token)
-
-    syms = [norm_symbol(s) for s in symbols.split(",") if norm_symbol(s)]
-    if not syms:
-        syms = ["BTCUSD", "XAUUSD"]
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        # signals snapshot
-        sigs: Dict[str, Any] = {}
-        for s in syms:
+        if symbol_norm:
             cur.execute("""
-                SELECT symbol, signal_id, action, source_ts, updated_utc, note
-                FROM signal_state
-                WHERE symbol = ?
-            """, (s,))
-            row = cur.fetchone()
+            SELECT * FROM heartbeats
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 200
+            """, (symbol_norm,))
+        else:
+            cur.execute("""
+            SELECT * FROM heartbeats
+            ORDER BY id DESC
+            LIMIT 500
+            """)
 
-            if row is None:
-                sigs[s] = {"latest": None, "updated_utc": None, "ack": None}
-                continue
-
-            sigs[s] = {
-                "latest": {
-                    "symbol": row["symbol"],
-                    "action": row["action"],
-                    "id": row["signal_id"],
-                    "ts": row["source_ts"],
-                },
-                "updated_utc": row["updated_utc"],
-                "ack": None,
-            }
-
+        rows = cur.fetchall()
         conn.close()
 
-    per_symbol = {}
-    for s in syms:
-        per_symbol[s] = {
-            "gate_combo": gate_combo(s),
-            "gate_r": {
-                "symbol": s,
-                "level": gate_combo(s)["r_level"],
-                "reasons": [],
-            },
-            "last_deals": last_rows("deals", s, limit_deals),
-            "last_risks": last_rows("risk_events", s, limit_risks),
-            "join_check": {
-                "symbol": s,
-                "status": "not_implemented_in_dashboard_v4_1",
-            },
-            "kpis": institutional_kpis(s, n=n_gate),
-        }
+    latest_map = {}
+    for r in rows:
+        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
+        if key not in latest_map:
+            latest_map[key] = r
 
-    portfolio_combo_level = "GREEN"
-    levels = [gate_combo(s)["combo_level"] for s in syms]
-    if any(lvl == "RED" for lvl in levels):
-        portfolio_combo_level = "RED"
-    elif any(lvl == "YELLOW" for lvl in levels):
-        portfolio_combo_level = "YELLOW"
+    result = []
+    connected_count = 0
 
-    portfolio = {
-        "r": {
-            "portfolio_level": portfolio_combo_level,
-            "symbols": syms,
-            "levels": {s: gate_combo(s)["r_level"] for s in syms},
-            "reasons": [],
-        },
-        "combo": {
-            "portfolio_level": portfolio_combo_level,
-            "symbols": syms,
-            "levels": {s: gate_combo(s)["combo_level"] for s in syms},
-            "reasons": [],
-        },
-        "kpis": portfolio_institutional_kpis(syms, n=n_gate),
+    for _, r in latest_map.items():
+        last_seen = parse_dt(r["last_seen_utc"])
+        connected = bool(last_seen and last_seen >= cutoff)
+        if connected:
+            connected_count += 1
+
+        result.append({
+            "account": r.get("account"),
+            "magic": r.get("magic"),
+            "symbol": r.get("symbol"),
+            "ea_name": r.get("ea_name"),
+            "version": r.get("version"),
+            "last_seen_utc": r.get("last_seen_utc"),
+            "connected": connected,
+            "status": r.get("status"),
+            "comment": r.get("comment"),
+        })
+
+    return {
+        "ok": True,
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "connected_count": connected_count,
+        "items": result
     }
+
+
+# -------------------------------------------------------------------
+# DEALS + RISKS
+# -------------------------------------------------------------------
+@app.post("/deal")
+def post_deal(data: DealIn):
+    deal_time = data.deal_time_utc or utc_iso()
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) AS cnt FROM ea_heartbeat")
-        device_row = cur.fetchone()
+
+        cur.execute("""
+        INSERT INTO deals(
+            account, magic, symbol, side, ticket, volume,
+            entry_price, exit_price, sl, tp,
+            pnl, pnl_currency, commission, swap,
+            risk_amount, r_multiple, strategy,
+            deal_time_utc, created_utc
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.side,
+            data.ticket,
+            data.volume,
+            data.entry_price,
+            data.exit_price,
+            data.sl,
+            data.tp,
+            data.pnl,
+            data.pnl_currency,
+            data.commission,
+            data.swap,
+            data.risk_amount,
+            data.r_multiple,
+            data.strategy,
+            deal_time,
+            utc_iso()
+        ))
+
+        conn.commit()
         conn.close()
 
+    return {"ok": True}
+
+
+@app.post("/risk")
+def post_risk(data: RiskIn):
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.account,
+            data.magic,
+            data.symbol.upper(),
+            data.event_type,
+            data.level,
+            data.message,
+            data.value,
+            utc_iso()
+        ))
+
+        conn.commit()
+        conn.close()
+
+    return {"ok": True}
+
+
+# -------------------------------------------------------------------
+# CONTROLS + GATES
+# -------------------------------------------------------------------
+@app.get("/controls/effective")
+def controls_effective(
+    symbol: Optional[str] = Query(default=None),
+    _: bool = Depends(app_token_guard)
+):
     return {
-        "utc": now_utc_iso(),
-        "symbols": syms,
-        "signals": sigs,
-        "devices": {
-            "count": int(device_row["cnt"] or 0),
+        "ok": True,
+        "controls": get_runtime_controls(symbol)
+    }
+
+
+@app.get("/status/gate_auto")
+def gate_auto(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+    gate = auto_gate_from_kpis(kpis)
+
+    return {
+        "ok": True,
+        "filters": {
+            "symbol": symbol.upper() if symbol else None,
+            "account": account,
+            "magic": magic,
+            "lookback_days": lookback_days,
+            "limit_trades": limit_trades,
         },
-        "portfolio": portfolio,
-        "per_symbol": per_symbol,
-        "note": "Institutional dashboard payload while preserving existing EA compatibility.",
+        "kpis": kpis,
+        "gate": gate
+    }
+
+
+@app.get("/status/gate_combo")
+def gate_combo(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+):
+    controls = get_runtime_controls(symbol)
+    auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
+    auto_gate = auto_payload["gate"]
+
+    paused = bool(controls["paused"])
+    controls_allow = bool(controls["allow_new_entries"])
+    auto_allow = bool(auto_gate["allow_new_entries"])
+
+    allow_new_entries = (not paused) and controls_allow and auto_allow
+
+    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
+
+    gate_level = auto_gate["gate_level"]
+    if paused:
+        gate_level = "RED"
+
+    reasons = []
+    if paused:
+        reasons.append("PAUSED")
+    if not controls_allow:
+        reasons.append("CONTROL_BLOCK")
+    reasons.extend(auto_gate.get("reasons", []))
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper() if symbol else None,
+        "gate_level": gate_level,
+        "allow_new_entries": allow_new_entries,
+        "risk_multiplier": round(final_risk_multiplier, 4),
+        "paused": paused,
+        "controls": controls,
+        "auto_gate": auto_gate,
+        "reasons": reasons
+    }
+
+
+# -------------------------------------------------------------------
+# KPI CORE (Phase 6)
+# -------------------------------------------------------------------
+def get_deals_filtered(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+):
+    dt_from = now_utc() - timedelta(days=lookback_days)
+
+    query = """
+    SELECT *
+    FROM deals
+    WHERE deal_time_utc >= ?
+    """
+    params = [utc_iso(dt_from)]
+
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol.upper())
+
+    if account:
+        query += " AND account = ?"
+        params.append(account)
+
+    if magic:
+        query += " AND magic = ?"
+        params.append(magic)
+
+    query += " ORDER BY deal_time_utc DESC LIMIT ?"
+    params.append(limit_trades)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    rows = list(reversed(rows))
+    return rows
+
+
+def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
+    curve = [0.0]
+    running = 0.0
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        running += pnl
+        curve.append(running)
+    return curve
+
+
+def calc_max_drawdown_abs(curve: List[float]) -> float:
+    peak = -10**18
+    max_dd = 0.0
+    for x in curve:
+        if x > peak:
+            peak = x
+        dd = peak - x
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd
+
+
+def calc_max_drawdown_pct(curve: List[float]) -> float:
+    peak = None
+    max_dd_pct = 0.0
+    for x in curve:
+        if peak is None or x > peak:
+            peak = x
+        if peak and peak > 0:
+            dd_pct = ((peak - x) / peak) * 100.0
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+    return max_dd_pct
+
+
+def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
+    streak = 0
+    max_streak = 0
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        if pnl < 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
+    streak = 0
+    for r in reversed(rows):
+        pnl = safe_float(r.get("pnl"), 0.0)
+        if pnl < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_trades = len(rows)
+    wins = 0
+    losses = 0
+    breakeven = 0
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    net_pnl = 0.0
+    total_r = 0.0
+
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        r_mult = safe_float(r.get("r_multiple"), 0.0)
+
+        net_pnl += pnl
+        total_r += r_mult
+
+        if pnl > 0:
+            wins += 1
+            gross_profit += pnl
+        elif pnl < 0:
+            losses += 1
+            gross_loss += abs(pnl)
+        else:
+            breakeven += 1
+
+    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    avg_pnl = (net_pnl / total_trades) if total_trades > 0 else 0.0
+    avg_r = (total_r / total_trades) if total_trades > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+    curve = calc_equity_curve_from_pnl(rows)
+    max_dd_abs = calc_max_drawdown_abs(curve)
+    max_dd_pct = calc_max_drawdown_pct(curve)
+    max_loss_streak = calc_loss_streak(rows)
+    current_loss_streak = calc_current_loss_streak(rows)
+
+    last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
+
+    return {
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "winrate_pct": round(winrate, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "net_pnl": round(net_pnl, 2),
+        "avg_pnl": round(avg_pnl, 2),
+        "sum_r": round(total_r, 2),
+        "avg_r": round(avg_r, 2),
+        "profit_factor": round(profit_factor, 2),
+        "max_drawdown_abs": round(max_dd_abs, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "max_loss_streak": max_loss_streak,
+        "current_loss_streak": current_loss_streak,
+        "last_trade_time_utc": last_trade_time,
+    }
+
+
+def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
+    if not AUTO_GATE_ENABLED:
+        return {
+            "gate_level": DEFAULT_GATE_LEVEL,
+            "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
+            "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
+            "reasons": ["AUTO_GATE_DISABLED"]
+        }
+
+    reasons_red = []
+    reasons_yellow = []
+
+    dd_pct = safe_float(kpi.get("max_drawdown_pct"))
+    cur_loss_streak = safe_int(kpi.get("current_loss_streak"))
+    sum_r = safe_float(kpi.get("sum_r"))
+    winrate = safe_float(kpi.get("winrate_pct"))
+    total_trades = safe_int(kpi.get("total_trades"))
+
+    if dd_pct >= RED_DD_PCT:
+        reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
+
+    if cur_loss_streak >= RED_LOSS_STREAK:
+        reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
+
+    if sum_r <= RED_R_SUM:
+        reasons_red.append(f"SUM_R<={RED_R_SUM}")
+
+    if total_trades >= 5 and winrate < RED_WINRATE_MIN:
+        reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
+
+    if reasons_red:
+        return {
+            "gate_level": "RED",
+            "allow_new_entries": False,
+            "risk_multiplier": 0.0,
+            "reasons": reasons_red
+        }
+
+    if dd_pct >= YELLOW_DD_PCT:
+        reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
+
+    if cur_loss_streak >= YELLOW_LOSS_STREAK:
+        reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
+
+    if sum_r <= YELLOW_R_SUM:
+        reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
+
+    if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
+        reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
+
+    if reasons_yellow:
+        return {
+            "gate_level": "YELLOW",
+            "allow_new_entries": True,
+            "risk_multiplier": 0.5,
+            "reasons": reasons_yellow
+        }
+
+    return {
+        "gate_level": "GREEN",
+        "allow_new_entries": True,
+        "risk_multiplier": 1.0,
+        "reasons": ["NORMAL"]
+    }
+
+
+# -------------------------------------------------------------------
+# KPI ENDPOINTS (Phase 6)
+# -------------------------------------------------------------------
+@app.get("/kpis/rolling")
+def rolling_kpis(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+
+    return {
+        "ok": True,
+        "filters": {
+            "symbol": symbol.upper() if symbol else None,
+            "account": account,
+            "magic": magic,
+            "lookback_days": lookback_days,
+            "limit_trades": limit_trades,
+        },
+        "kpis": kpis
+    }
+
+
+@app.get("/status/system_overview")
+def system_overview(
+    symbol: Optional[str] = Query(default=None),
+    account: Optional[str] = Query(default=None),
+    magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
+):
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+    gate = auto_gate_from_kpis(kpis)
+
+    heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
+    try:
+        if symbol:
+            heartbeat_payload = heartbeat_status(symbol=symbol)
+        else:
+            heartbeat_payload = heartbeat_status()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "server_time_utc": utc_iso(),
+        "filters": {
+            "symbol": symbol.upper() if symbol else None,
+            "account": account,
+            "magic": magic,
+            "lookback_days": lookback_days,
+            "limit_trades": limit_trades,
+        },
+        "heartbeat": heartbeat_payload,
+        "controls": get_runtime_controls(symbol),
+        "kpis": kpis,
+        "gate": gate
     }
