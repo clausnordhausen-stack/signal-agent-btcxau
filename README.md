@@ -1,27 +1,65 @@
-# Deploy FastAPI on Render
+# Signal Agent API
 
-Use this repo as a template to deploy a Python [FastAPI](https://fastapi.tiangolo.com) service on Render.
+A production-style backend system for processing, filtering and distributing trading signals using Python and FastAPI.
 
-See https://render.com/docs/deploy-fastapi or follow the steps below:
+## 🚀 Overview
 
-## Manual Steps
+This project implements a full signal-processing pipeline including:
 
-1. You may use this repository directly or [create your own repository from this template](https://github.com/render-examples/fastapi/generate) if you'd like to customize the code.
-2. Create a new Web Service on Render.
-3. Specify the URL to your new repository or this repository.
-4. Render will automatically detect that you are deploying a Python service and use `pip` to download the dependencies.
-5. Specify the following as the Start Command.
+- Signal ingestion via API
+- Filtering based on score and risk logic
+- Dynamic execution engine
+- Risk management system
+- Customer & account handling
+- Delivery tracking & acknowledgment
+- KPI and performance analysis
 
-    ```shell
-    uvicorn main:app --host 0.0.0.0 --port $PORT
-    ```
+## 🧠 Core Features
 
-6. Click Create Web Service.
+### Signal Engine
+- Receives and processes trading signals
+- Applies scoring and filtering logic
+- Distributes signals to connected clients
 
-Or simply click:
+### Risk Engine
+- Daily loss limits
+- Trade count limits
+- R-multiple tracking
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/render-examples/fastapi)
+### Auto Gate System
+- KPI-based decision engine
+- Automatically blocks or reduces risk based on:
+  - drawdown
+  - win rate
+  - loss streak
 
-## Thanks
+### Execution Engine
+- Dynamic risk adjustment based on signal score
+- Multiple modes: safe / normal / aggressive
 
-Thanks to [Harish](https://harishgarg.com) for the [inspiration to create a FastAPI quickstart for Render](https://twitter.com/harishkgarg/status/1435084018677010434) and for some sample code!
+### Authentication System
+- JWT-based login
+- Role-based access (master / customer)
+
+### Monitoring & Debugging
+- Heartbeat tracking (client connection monitoring)
+- Debug endpoints for signals and deliveries
+- KPI analytics endpoints
+
+## 🛠 Tech Stack
+
+- Python
+- FastAPI
+- SQLite
+- JWT Authentication
+- REST API design
+
+## 📊 Why this project matters
+
+This system demonstrates:
+
+- backend architecture design
+- API structuring and endpoint logic
+- state handling (signals, deliveries, trades)
+- risk-based decision systems
+- real-world use case implementation
