@@ -280,8 +280,12 @@ class UserResponse(BaseModel):
 
 
 class TVSignalIn(BaseModel):
+    key: Optional[str] = None
     symbol: str
     side: Optional[str] = None
+    action: Optional[str] = None
+    id: Optional[str] = None
+    ts: Optional[str] = None
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -384,12 +388,26 @@ def me(current_user: dict = Depends(get_current_user)):
 # -------------------------------------------------------------------
 @app.post("/tv")
 def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
-    if x_api_key != TV_API_KEY:
+    req_key = (x_api_key or data.key or "").strip()
+    if req_key != TV_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     symbol = data.symbol.strip().upper()
-    side = (data.side or "").strip().upper()
-    payload_json = json.dumps(data.payload or {}, ensure_ascii=False)
+
+    side_raw = (data.side or data.action or "").strip().upper()
+    if side_raw in ["BUY", "LONG"]:
+        side = "BUY"
+    elif side_raw in ["SELL", "SHORT"]:
+        side = "SELL"
+    else:
+        side = ""
+
+    payload = data.payload or {}
+    payload["tv_id"] = data.id
+    payload["tv_ts"] = data.ts
+    payload["raw_action"] = data.action
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
     now = utc_iso()
 
     with DB_LOCK:
@@ -445,6 +463,7 @@ def latest_signal(
         FROM signals s
         WHERE s.symbol = ?
           AND s.status = 'pending'
+          AND s.side IN ('BUY', 'SELL')
           AND NOT EXISTS (
               SELECT 1 FROM signal_acks a
               WHERE a.signal_id = s.id
@@ -469,15 +488,19 @@ def latest_signal(
         }
 
     try:
-        row["payload"] = json.loads(row.get("payload_json") or "{}")
+        payload = json.loads(row.get("payload_json") or "{}")
     except Exception:
-        row["payload"] = {}
+        payload = {}
 
     return {
         "ok": True,
         "has_signal": True,
         "blocked": False,
         "symbol": symbol,
+        "side": row.get("side"),
+        "updated_utc": row.get("updated_utc"),
+        "signal_id": row.get("id"),
+        "payload": payload,
         "controls": controls,
         "gate": gate_payload,
         "signal": row
